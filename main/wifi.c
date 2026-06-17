@@ -25,13 +25,13 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         if (s_retry_num < MAX_RETRY) {
             esp_wifi_connect();
             s_retry_num++;
-            ESP_LOGI(TAG, "重连 Wi-Fi... (%d/%d)", s_retry_num, MAX_RETRY);
+            ESP_LOGI(TAG, "Wi-Fi reconnect (%d/%d)", s_retry_num, MAX_RETRY);
         } else {
             xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "获取到 IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         s_retry_num = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     }
@@ -73,7 +73,7 @@ int wifi_connect(const char *ssid, const char *password)
     // 关闭 WiFi 省电模式，避免流式接收数据时丢包
     esp_wifi_set_ps(WIFI_PS_NONE);
 
-    ESP_LOGI(TAG, "正在连接 Wi-Fi: %s", ssid);
+    ESP_LOGI(TAG, "Connecting Wi-Fi: %s", ssid);
 
     // 等待连上或失败
     EventBits_t bits = xEventGroupWaitBits(
@@ -82,9 +82,9 @@ int wifi_connect(const char *ssid, const char *password)
         pdFALSE, pdFALSE, portMAX_DELAY);
 
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "Wi-Fi 连接成功");
+        ESP_LOGI(TAG, "Wi-Fi connected");
         return 0;
     }
-    ESP_LOGE(TAG, "Wi-Fi 连接失败");
+    ESP_LOGE(TAG, "Wi-Fi connect failed");
     return -1;
 }

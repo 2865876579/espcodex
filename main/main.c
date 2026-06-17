@@ -2,21 +2,32 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "driver/uart.h"
 #include "wifi.h"
 #include "audio_out.h"
 #include "afe_wake_word.h"
 #include "ws_client.h"
-#include "mbedtls/base64.h"
+#include "opus.h"
 
 #define WIFI_SSID  "qwe"
 #define WIFI_PASS  "12345678"
 #define WS_URI     "ws://39.106.190.124:8000/ws/esp32"
 
 #define SAMPLE_RATE     16000
+#define OPUS_FRAME_SAMPLES (SAMPLE_RATE * 60 / 1000)
+#define OPUS_MAX_PACKET_BYTES 400
+#define OPUS_UPLOAD_STACK_BYTES (64 * 1024)
+#define OPUS_UPLOAD_QUEUE_LEN 1
+#define OPUS_UPLOAD_PRIORITY 3
+#define OPUS_UPLOAD_OK 1
+#define OPUS_UPLOAD_FAILED 2
 #define REC_MAX_DURATION_MS 6000
 
 #define WAKE_TRIGGER_TEXT "__wake__"
@@ -25,6 +36,7 @@
 #define WAKE_REPLY_TIMEOUT_MS 30000
 #define TURN_REPLY_TIMEOUT_MS 60000
 #define NO_SPEECH_DELAY_MS 250
+#define ENABLE_UART_TEXT_INPUT 0
 
 #define SPEECH_AC_AVG_THRESHOLD 160
 #define SPEECH_PEAK_THRESHOLD 1000
@@ -42,6 +54,8 @@ static const char *TAG = "app";
 
 static volatile bool s_wake_event = false;
 static volatile bool s_dialog_active = false;
+static QueueHandle_t s_opus_upload_queue = NULL;
+static TaskHandle_t s_opus_upload_task = NULL;
 
 typedef enum {
     RECORD_SENT,
@@ -55,6 +69,16 @@ typedef enum {
     TURN_TIMEOUT,
     TURN_WS_LOST,
 } turn_wait_result_t;
+
+typedef struct {
+    int16_t *pcm;
+    int trim_start;
+    int trim_samples;
+    int ac_avg;
+    int peak;
+    int active;
+    TaskHandle_t waiter;
+} opus_upload_job_t;
 
 static bool wait_for_ws_connected(int timeout_ms)
 {
@@ -209,6 +233,154 @@ static bool pcm_find_speech_bounds(const int16_t *pcm, int samples,
     *out_count = end - start;
     return true;
 }
+static bool send_opus_upload(const opus_upload_job_t *job)
+{
+    const int16_t *send_pcm = job->pcm + job->trim_start;
+
+    int opus_err = OPUS_OK;
+    OpusEncoder *encoder = opus_encoder_create(SAMPLE_RATE, 1, OPUS_APPLICATION_VOIP, &opus_err);
+    if (!encoder || opus_err != OPUS_OK) {
+        ESP_LOGE(TAG, "opus encoder create failed: %d", opus_err);
+        return false;
+    }
+    opus_encoder_ctl(encoder, OPUS_SET_BITRATE(24000));
+    opus_encoder_ctl(encoder, OPUS_SET_COMPLEXITY(0));
+    opus_encoder_ctl(encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
+    opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
+    opus_encoder_ctl(encoder, OPUS_SET_DTX(1));
+
+    char start_json[160];
+    snprintf(start_json, sizeof(start_json),
+             "{\"type\":\"audio_start\",\"codec\":\"opus\",\"sample_rate\":%d,\"channels\":1,\"frame_duration_ms\":60,\"samples\":%d}",
+             SAMPLE_RATE, job->trim_samples);
+
+    bool sent = ws_client_send_raw(start_json);
+    if (!sent) {
+        ESP_LOGE(TAG, "audio_start send failed");
+    }
+
+    uint8_t opus_packet[OPUS_MAX_PACKET_BYTES];
+    int16_t *pad_frame = heap_caps_malloc(OPUS_FRAME_SAMPLES * sizeof(int16_t),
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!pad_frame) {
+        pad_frame = malloc(OPUS_FRAME_SAMPLES * sizeof(int16_t));
+    }
+    if (!pad_frame) {
+        ESP_LOGE(TAG, "opus pad frame alloc failed");
+        opus_encoder_destroy(encoder);
+        return false;
+    }
+
+    int chunks = 0;
+    int opus_bytes = 0;
+    UBaseType_t start_watermark = uxTaskGetStackHighWaterMark(NULL);
+
+    for (int offset = 0; sent && offset < job->trim_samples; offset += OPUS_FRAME_SAMPLES) {
+        int frame_samples = job->trim_samples - offset;
+        const int16_t *frame = send_pcm + offset;
+        if (frame_samples < OPUS_FRAME_SAMPLES) {
+            memcpy(pad_frame, frame, frame_samples * sizeof(int16_t));
+            memset(pad_frame + frame_samples, 0, (OPUS_FRAME_SAMPLES - frame_samples) * sizeof(int16_t));
+            frame = pad_frame;
+        } else {
+            frame_samples = OPUS_FRAME_SAMPLES;
+        }
+
+        int encoded = opus_encode(encoder, frame, OPUS_FRAME_SAMPLES, opus_packet, sizeof(opus_packet));
+        if (encoded <= 0) {
+            ESP_LOGE(TAG, "opus encode failed: %d", encoded);
+            sent = false;
+            break;
+        }
+        if (!ws_client_send_binary(opus_packet, encoded)) {
+            ESP_LOGE(TAG, "opus frame send failed at chunk=%d len=%d", chunks + 1, encoded);
+            sent = false;
+            break;
+        }
+        chunks++;
+        opus_bytes += encoded;
+    }
+
+    char end_json[96];
+    snprintf(end_json, sizeof(end_json),
+             "{\"type\":\"audio_end\",\"codec\":\"opus\",\"chunks\":%d,\"bytes\":%d}",
+             chunks, opus_bytes);
+    if (sent) {
+        sent = ws_client_send_raw(end_json);
+        if (!sent) {
+            ESP_LOGE(TAG, "audio_end send failed");
+        }
+    }
+
+    UBaseType_t end_watermark = uxTaskGetStackHighWaterMark(NULL);
+    free(pad_frame);
+    opus_encoder_destroy(encoder);
+
+    ESP_LOGI(TAG,
+             "Send audio: opus_frames=%d opus_bytes=%d pcm_samples=%d ac_avg=%d peak=%d active=%d stack_hw=%u->%u",
+             chunks, opus_bytes, job->trim_samples, job->ac_avg, job->peak, job->active,
+             (unsigned)start_watermark, (unsigned)end_watermark);
+
+    return sent;
+}
+
+static void opus_upload_task(void *arg)
+{
+    (void)arg;
+    opus_upload_job_t job;
+
+    while (1) {
+        if (xQueueReceive(s_opus_upload_queue, &job, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        bool sent = false;
+        if (job.pcm && ws_client_is_connected()) {
+            sent = send_opus_upload(&job);
+        } else {
+            ESP_LOGW(TAG, "opus upload skipped: pcm=%p connected=%d",
+                     job.pcm, ws_client_is_connected() ? 1 : 0);
+        }
+
+        free(job.pcm);
+        if (job.waiter) {
+            xTaskNotify(job.waiter, sent ? OPUS_UPLOAD_OK : OPUS_UPLOAD_FAILED, eSetValueWithOverwrite);
+        }
+    }
+}
+
+static bool start_opus_upload_task(void)
+{
+    if (s_opus_upload_queue && s_opus_upload_task) {
+        return true;
+    }
+
+    s_opus_upload_queue = xQueueCreate(OPUS_UPLOAD_QUEUE_LEN, sizeof(opus_upload_job_t));
+    if (!s_opus_upload_queue) {
+        ESP_LOGE(TAG, "opus upload queue create failed");
+        return false;
+    }
+
+    BaseType_t ret = xTaskCreateWithCaps(opus_upload_task, "opus_upload",
+                                         OPUS_UPLOAD_STACK_BYTES, NULL,
+                                         OPUS_UPLOAD_PRIORITY, &s_opus_upload_task,
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ret != pdPASS) {
+        ESP_LOGW(TAG, "opus upload PSRAM stack create failed, fallback internal");
+        ret = xTaskCreate(opus_upload_task, "opus_upload", OPUS_UPLOAD_STACK_BYTES,
+                          NULL, OPUS_UPLOAD_PRIORITY, &s_opus_upload_task);
+    }
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "opus upload task create failed");
+        vQueueDelete(s_opus_upload_queue);
+        s_opus_upload_queue = NULL;
+        return false;
+    }
+
+    ESP_LOGI(TAG, "opus upload task started, stack=%d bytes", OPUS_UPLOAD_STACK_BYTES);
+    return true;
+}
+
 static record_result_t record_and_send(void)
 {
     int total = SAMPLE_RATE * REC_MAX_DURATION_MS / 1000;
@@ -254,49 +426,38 @@ static record_result_t record_and_send(void)
         return RECORD_NO_SPEECH;
     }
 
-    size_t pcm_bytes = trim_samples * sizeof(int16_t);
-    size_t b64_len = ((pcm_bytes + 2) / 3) * 4 + 8;
-    char *b64 = malloc(b64_len);
-    if (!b64) {
+    if (!s_opus_upload_queue) {
+        ESP_LOGE(TAG, "opus upload task not ready");
         free(pcm);
         return RECORD_FAILED;
     }
 
-    size_t out = 0;
-    int enc_ret = mbedtls_base64_encode((unsigned char *)b64, b64_len, &out,
-                                        (const unsigned char *)send_pcm, pcm_bytes);
-    free(pcm);
-    if (enc_ret != 0) {
-        ESP_LOGE(TAG, "base64 encode failed: %d", enc_ret);
-        free(b64);
+    uint32_t notify_value = 0;
+    xTaskNotifyWait(0, UINT32_MAX, &notify_value, 0);
+
+    opus_upload_job_t job = {
+        .pcm = pcm,
+        .trim_start = trim_start,
+        .trim_samples = trim_samples,
+        .ac_avg = ac_avg,
+        .peak = peak,
+        .active = active,
+        .waiter = xTaskGetCurrentTaskHandle(),
+    };
+
+    if (xQueueSend(s_opus_upload_queue, &job, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGE(TAG, "opus upload queue send failed");
+        free(pcm);
         return RECORD_FAILED;
     }
 
-    const char *prefix = "{\"type\":\"audio\",\"audio\":\"";
-    const char *suffix = "\"}";
-    size_t json_len = strlen(prefix) + out + strlen(suffix) + 1;
-    char *json = malloc(json_len);
-    if (!json) {
-        free(b64);
+    if (xTaskNotifyWait(0, UINT32_MAX, &notify_value, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "opus upload wait failed");
         return RECORD_FAILED;
     }
 
-    int pos = snprintf(json, json_len, "%s", prefix);
-    memcpy(json + pos, b64, out);
-    pos += (int)out;
-    memcpy(json + pos, suffix, strlen(suffix));
-    pos += (int)strlen(suffix);
-    json[pos] = '\0';
-    free(b64);
-
-    ESP_LOGI(TAG, "Send audio: base64=%d bytes samples=%d ac_avg=%d peak=%d active=%d",
-             (int)out, trim_samples, ac_avg, peak, active);
-    bool sent = ws_client_send_raw(json);
-    free(json);
-
-    return sent ? RECORD_SENT : RECORD_FAILED;
+    return notify_value == OPUS_UPLOAD_OK ? RECORD_SENT : RECORD_FAILED;
 }
-
 static void run_dialog(void)
 {
     s_dialog_active = true;
@@ -373,6 +534,12 @@ static void on_wake_word(void)
 void app_main(void)
 {
     ESP_LOGI(TAG, "=== smart pillow firmware start ===");
+    if (!start_opus_upload_task()) {
+        ESP_LOGE(TAG, "Opus upload task init failed");
+        while (1) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
     audio_out_init();
 
     uart_config_t uart_cfg = {
@@ -437,8 +604,22 @@ void app_main(void)
             }
 
             if (strlen(cmd) > 0) {
-                ESP_LOGI(TAG, "Send text: %s", cmd);
-                ws_client_send_text(cmd);
+#if ENABLE_UART_TEXT_INPUT
+                if (strncmp(cmd, "text:", 5) == 0) {
+                    char *payload = cmd + 5;
+                    while (*payload == ' ') {
+                        payload++;
+                    }
+                    if (*payload) {
+                        ESP_LOGI(TAG, "UART text command received (%d bytes)", (int)strlen(payload));
+                        ws_client_send_text(payload);
+                    }
+                } else {
+                    ESP_LOGI(TAG, "UART input ignored (%d bytes)", (int)strlen(cmd));
+                }
+#else
+                ESP_LOGI(TAG, "UART input ignored (%d bytes)", (int)strlen(cmd));
+#endif
             }
         }
         vTaskDelay(pdMS_TO_TICKS(50));

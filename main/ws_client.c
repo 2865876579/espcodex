@@ -146,8 +146,8 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
                     s_turn_done = false;
                     s_pending_dialog_end = false;
                     cJSON *text = cJSON_GetObjectItem(json, "text");
-                    ESP_LOGI(TAG, "TTS: %s",
-                             (text && cJSON_IsString(text)) ? text->valuestring : "");
+                    ESP_LOGI(TAG, "TTS text received, len=%d",
+                             (text && cJSON_IsString(text)) ? (int)strlen(text->valuestring) : 0);
                 }
                 else if (strcmp(type->valuestring, "tts_audio_chunk") == 0) {
                     cJSON *audio = cJSON_GetObjectItem(json, "audio");
@@ -181,7 +181,7 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
                         ESP_LOGI(TAG, "Dialog end requested by cloud");
                     }
                     ESP_LOGI(TAG, "TTS end (%d frames)", total);
-                    printf("回复完毕\n");
+                    printf("dialog turn done\n");
 
                     // 流结束标记
                     audio_chunk_t end = { .data = NULL, .len = 0 };
@@ -189,14 +189,14 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
                 }
                 else if (strcmp(type->valuestring, "status") == 0) {
                     cJSON *msg = cJSON_GetObjectItem(json, "msg");
-                    ESP_LOGI(TAG, "STATUS: %s",
-                             (msg && cJSON_IsString(msg)) ? msg->valuestring : "");
+                    ESP_LOGI(TAG, "STATUS received, len=%d",
+                             (msg && cJSON_IsString(msg)) ? (int)strlen(msg->valuestring) : 0);
                     s_turn_done = true;
                 }
                 else if (strcmp(type->valuestring, "stt_result") == 0) {
                     cJSON *text = cJSON_GetObjectItem(json, "text");
-                    ESP_LOGI(TAG, "STT: %s",
-                             (text && cJSON_IsString(text)) ? text->valuestring : "");
+                    ESP_LOGI(TAG, "STT text received, len=%d",
+                             (text && cJSON_IsString(text)) ? (int)strlen(text->valuestring) : 0);
                 }
                 else if (strcmp(type->valuestring, "dialog_end") == 0) {
                     s_dialog_end = true;
@@ -317,6 +317,19 @@ bool ws_client_send_raw(const char *json_str)
     ESP_LOGI(TAG, "Sending raw JSON (%d bytes)", json_len);
     int sent = esp_websocket_client_send_text(s_client, json_str, json_len, portMAX_DELAY);
     ESP_LOGI(TAG, "Raw JSON sent (%d bytes)", json_len);
+    return sent >= 0;
+}
+bool ws_client_send_binary(const uint8_t *data, int len)
+{
+    if (!s_client || !esp_websocket_client_is_connected(s_client)) {
+        ESP_LOGW(TAG, "WebSocket not connected, cannot send binary");
+        return false;
+    }
+    if (!data || len <= 0) {
+        return false;
+    }
+
+    int sent = esp_websocket_client_send_bin(s_client, (const char *)data, len, portMAX_DELAY);
     return sent >= 0;
 }
 

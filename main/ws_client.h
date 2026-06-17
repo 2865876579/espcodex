@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,6 +26,8 @@ bool ws_client_send_text(const char *text);
  * Use for audio, control messages etc. that are already valid JSON.
  */
 bool ws_client_send_raw(const char *json_str);
+
+bool ws_client_send_binary(const uint8_t *data, int len);
 
 bool ws_client_is_connected(void);
 bool ws_client_is_tts_active(void);
