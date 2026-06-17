@@ -22,9 +22,16 @@ static volatile bool s_turn_done = false;
 static volatile bool s_dialog_end = false;
 static volatile bool s_pending_dialog_end = false;
 static QueueHandle_t s_audio_queue = NULL;  // 音频数据队列（WebSocket → Audio Task）
+static volatile uint32_t s_tts_chunks_queued = 0;
+static volatile uint32_t s_tts_chunks_dropped = 0;
 
 #define OPUS_SAMPLE_RATE    16000
 #define OPUS_CHANNELS       1
+#define AUDIO_QUEUE_DEPTH   512
+#define AUDIO_PLAYER_STACK_BYTES 24576
+#define AUDIO_QUEUE_SEND_TIMEOUT_MS 100
+#define AUDIO_END_SEND_TIMEOUT_MS 5000
+#define AUDIO_PLAYBACK_DRAIN_MS 350
 
 // 队列元素：一个 Opus 编码帧
 typedef struct {
@@ -45,6 +52,7 @@ static void audio_player_task(void *arg)
 
     OpusDecoder *decoder = NULL;
     audio_chunk_t chunk;
+    int played_frames = 0;
 
     while (1) {
         if (xQueueReceive(s_audio_queue, &chunk, pdMS_TO_TICKS(5000)) != pdTRUE) {
@@ -58,9 +66,14 @@ static void audio_player_task(void *arg)
                 decoder = NULL;
                 ESP_LOGI(TAG, "Opus decoder reset");
             }
+            if (played_frames > 0) {
+                vTaskDelay(pdMS_TO_TICKS(AUDIO_PLAYBACK_DRAIN_MS));
+                played_frames = 0;
+            }
             if (s_tts_active) {
                 s_tts_active = false;
                 s_turn_done = true;
+                printf("dialog turn done\n");
                 if (s_pending_dialog_end) {
                     s_dialog_end = true;
                     s_pending_dialog_end = false;
@@ -102,6 +115,7 @@ static void audio_player_task(void *arg)
 
         // I2S 输出 —— 这个任务可以慢慢等 DMA 空间
         audio_out_write((const uint8_t *)stereo, samples * 4);
+        played_frames++;
     }
 }
 
@@ -145,6 +159,8 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
                     s_tts_active = true;
                     s_turn_done = false;
                     s_pending_dialog_end = false;
+                    s_tts_chunks_queued = 0;
+                    s_tts_chunks_dropped = 0;
                     cJSON *text = cJSON_GetObjectItem(json, "text");
                     ESP_LOGI(TAG, "TTS text received, len=%d",
                              (text && cJSON_IsString(text)) ? (int)strlen(text->valuestring) : 0);
@@ -165,9 +181,18 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
 
                                 // 入队列（非阻塞，队满就丢，保护 websocket 任务）
                                 audio_chunk_t chunk = { .data = opus_data, .len = actual };
-                                if (xQueueSend(s_audio_queue, &chunk, 0) != pdTRUE) {
-                                    free(opus_data);
+                                if (xQueueSend(s_audio_queue, &chunk,
+                                               pdMS_TO_TICKS(AUDIO_QUEUE_SEND_TIMEOUT_MS)) == pdTRUE) {
+                                    s_tts_chunks_queued++;
+                                    opus_data = NULL;
+                                } else {
+                                    s_tts_chunks_dropped++;
+                                    ESP_LOGW(TAG, "TTS audio queue full, drop=%lu queued=%lu waiting=%u",
+                                             (unsigned long)s_tts_chunks_dropped,
+                                             (unsigned long)s_tts_chunks_queued,
+                                             s_audio_queue ? (unsigned)uxQueueMessagesWaiting(s_audio_queue) : 0);
                                 }
+                                free(opus_data);
                             }
                         }
                     }
@@ -180,12 +205,18 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
                         s_pending_dialog_end = true;
                         ESP_LOGI(TAG, "Dialog end requested by cloud");
                     }
-                    ESP_LOGI(TAG, "TTS end (%d frames)", total);
-                    printf("dialog turn done\n");
+                    ESP_LOGI(TAG, "TTS end rx (%d frames queued=%lu dropped=%lu waiting=%u)",
+                             total,
+                             (unsigned long)s_tts_chunks_queued,
+                             (unsigned long)s_tts_chunks_dropped,
+                             s_audio_queue ? (unsigned)uxQueueMessagesWaiting(s_audio_queue) : 0);
 
-                    // 流结束标记
                     audio_chunk_t end = { .data = NULL, .len = 0 };
-                    xQueueSend(s_audio_queue, &end, 0);
+                    if (xQueueSend(s_audio_queue, &end,
+                                   pdMS_TO_TICKS(AUDIO_END_SEND_TIMEOUT_MS)) != pdTRUE) {
+                        ESP_LOGE(TAG, "TTS end marker enqueue failed");
+                        s_turn_done = true;
+                    }
                 }
                 else if (strcmp(type->valuestring, "status") == 0) {
                     cJSON *msg = cJSON_GetObjectItem(json, "msg");
@@ -229,11 +260,11 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
 void ws_client_start(const char *uri)
 {
     // 音频队列：深度 256（只存指针，内存开销极小）
-    s_audio_queue = xQueueCreate(256, sizeof(audio_chunk_t));
+    s_audio_queue = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(audio_chunk_t));
 
     // 音频播放任务：16KB 栈，优先级 5
     // 音频播放任务：16KB 栈，优先级 4（需要及时取队列 + 写 I2S）
-    xTaskCreate(audio_player_task, "audio_player", 16384, NULL, 4, NULL);
+    xTaskCreate(audio_player_task, "audio_player", AUDIO_PLAYER_STACK_BYTES, NULL, 3, NULL);
 
     // WebSocket 客户端：16KB 栈（库内部帧解析也需要栈空间！）
     esp_websocket_client_config_t ws_cfg = {

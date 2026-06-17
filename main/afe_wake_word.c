@@ -39,6 +39,13 @@ static volatile int  s_capture_last_voice_idx = 0;
 #define CAPTURE_ACTIVE_LEVEL         1000
 // 防重复触发冷却 (fetch 周期数)
 #define COOLDOWN_TICKS  150
+#define AFE_INTERNAL_PRIORITY 1
+#define AFE_FEED_TASK_PRIORITY 8
+#define AFE_FETCH_TASK_PRIORITY 3
+#define AFE_FEED_TASK_STACK_BYTES (2048 * 3)
+#define AFE_FETCH_TASK_STACK_BYTES 8192
+#define AFE_FEED_TASK_CORE 0
+#define AFE_INTERNAL_CORE 1
 static volatile int s_cooldown = 0;
 
 // I2S1 RX 句柄
@@ -207,7 +214,9 @@ static void afe_fetch_task(void *arg)
     bool first = true;
 
     while (1) {
-        afe_fetch_result_t *res = s_afe_handle->fetch(s_afe_data);
+        afe_fetch_result_t *res = s_afe_handle->fetch_with_delay
+            ? s_afe_handle->fetch_with_delay(s_afe_data, portMAX_DELAY)
+            : s_afe_handle->fetch(s_afe_data);
         if (!res || res->ret_value == ESP_FAIL) {
             vTaskDelay(1);
             continue;
@@ -330,14 +339,16 @@ int afe_wake_word_init(wake_word_callback_t cb)
     cfg->vad_min_noise_ms   = 300;
     cfg->vad_delay_ms       = 128;
     cfg->agc_init           = false;
-    cfg->afe_perferred_core     = 1;
-    cfg->afe_perferred_priority = 5;
+    cfg->afe_perferred_core     = AFE_INTERNAL_CORE;
+    cfg->afe_perferred_priority = AFE_INTERNAL_PRIORITY;
     cfg->memory_alloc_mode      = AFE_MEMORY_ALLOC_MORE_PSRAM;
 
     // 5. 校验（调整不兼容参数）
     cfg = afe_config_check(cfg);
 
     // ★ 在 check 之后设 gain，防止被覆盖
+    cfg->afe_perferred_core     = AFE_INTERNAL_CORE;
+    cfg->afe_perferred_priority = AFE_INTERNAL_PRIORITY;
     cfg->afe_linear_gain = 1.0f;
     afe_config_print(cfg);
 
@@ -371,9 +382,23 @@ int afe_wake_word_init(wake_word_callback_t cb)
     // 9. 释放配置（不再需要）
     afe_config_free(cfg);
 
-    // 10. 启动双任务（参考小智架构）
-    xTaskCreate(afe_feed_task,  "afe_feed",  8192, NULL, 5, NULL);
-    xTaskCreate(afe_fetch_task, "afe_fetch", 8192, NULL, 5, NULL);
+    // Start fetch before feed so AFE has a reader before microphone frames arrive.
+    BaseType_t fetch_ret = xTaskCreate(afe_fetch_task, "afe_fetch",
+                                       AFE_FETCH_TASK_STACK_BYTES, NULL,
+                                       AFE_FETCH_TASK_PRIORITY, NULL);
+    if (fetch_ret != pdPASS) {
+        ESP_LOGE(TAG, "afe_fetch task create failed: %ld", (long)fetch_ret);
+        return -1;
+    }
+
+    BaseType_t feed_ret = xTaskCreatePinnedToCore(afe_feed_task, "afe_feed",
+                                                 AFE_FEED_TASK_STACK_BYTES, NULL,
+                                                 AFE_FEED_TASK_PRIORITY, NULL,
+                                                 AFE_FEED_TASK_CORE);
+    if (feed_ret != pdPASS) {
+        ESP_LOGE(TAG, "afe_feed task create failed: %ld", (long)feed_ret);
+        return -1;
+    }
 
     ESP_LOGI(TAG, "AFE pipeline started, listening...");
     return 0;
