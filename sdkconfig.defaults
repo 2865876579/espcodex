@@ -1,0 +1,25 @@
+# ===== Chip / Flash / PSRAM =====
+CONFIG_IDF_TARGET="esp32s3"
+
+# N16R8: 16MB Flash
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# N16R8: 8MB PSRAM (Octal SPI), needed for audio buffers
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# ===== Partition table: custom with model partition =====
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ===== Main task stack =====
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# ===== Log level =====
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# ===== ESP-SR: 唤醒词 "你好小智" =====
+CONFIG_SR_WN_WN9_NIHAOXIAOZHI_TTS=y
