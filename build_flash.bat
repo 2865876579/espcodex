@@ -1,59 +1,61 @@
 @echo off
 setlocal EnableExtensions
 
-rem Build and flash the ESP-IDF firmware. Usage: build_flash.bat [COM_PORT] [--nopause]
-set "PROJECT_DIR=%~dp0"
-if "%PROJECT_DIR:~-1%"=="\" set "PROJECT_DIR=%PROJECT_DIR:~0,-1%"
+set "PROJ=%~dp0"
+set "PROJ=%PROJ:~0,-1%"
+cd /d "%PROJ%"
 
 set "ESP_PORT=COM3"
-set "NO_PAUSE=0"
-if not "%~1"=="" if /i not "%~1"=="--nopause" set "ESP_PORT=%~1"
-if /i "%~1"=="--nopause" set "NO_PAUSE=1"
-if /i "%~2"=="--nopause" set "NO_PAUSE=1"
+set "ESP_BAUD=460800"
+if not "%~1"=="" set "ESP_PORT=%~1"
 
-set "IDF_PATH=D:\Espressif\frameworks\esp-idf-v5.1.2"
-set "IDF_TOOLS_PATH=D:\Espressif"
-set "IDF_PYTHON=D:\Espressif\python_env\idf5.1_py3.11_env\Scripts\python.exe"
-set "IDF_PY=%IDF_PATH%\tools\idf.py"
-set "PYTHONUTF8=1"
-set "PYTHONIOENCODING=utf-8"
-set "PATH=D:\Espressif\tools\xtensa-esp32s3-elf\esp-12.2.0_20230208\xtensa-esp32s3-elf\bin;D:\Espressif\tools\cmake\3.24.0\bin;D:\Espressif\tools\ninja\1.11.0;%PATH%"
+set "IDF_TOOLS=D:\Espressif"
+set "PYTHON=%IDF_TOOLS%\python_env\idf5.1_py3.11_env\Scripts\python.exe"
+set "ESPTOOL=%PYTHON% %IDF_TOOLS%\frameworks\esp-idf-v5.1.2\components\esptool_py\esptool\esptool.py"
+set "NINJA=%IDF_TOOLS%\tools\ninja\1.10.2\ninja.exe"
 
-if not exist "%IDF_PYTHON%" (
-  echo Python not found: %IDF_PYTHON%
-  goto fail
+echo ============================================
+echo   ESP32-S3 Build ^& Flash (AEC enabled)
+echo   Port: %ESP_PORT%
+echo ============================================
+echo.
+
+rem ---------- Step 1: Build ----------
+echo [1/3] Building firmware...
+"%NINJA%" -C "%PROJ%\build"
+if errorlevel 1 (
+    echo BUILD FAILED
+    pause
+    exit /b 1
 )
-if not exist "%IDF_PY%" (
-  echo idf.py not found: %IDF_PY%
-  goto fail
+echo.
+
+rem ---------- Step 2: Generate srmodels.bin ----------
+echo [2/3] Packing wake word model...
+if not exist "%PROJ%\build\srmodels" mkdir "%PROJ%\build\srmodels"
+"%PYTHON%" "%PROJ%\managed_components\espressif__esp-sr\model\movemodel.py" -d1 "%PROJ%\sdkconfig" -d2 "%PROJ%\managed_components\espressif__esp-sr" -d3 "%PROJ%\build"
+if errorlevel 1 (
+    echo MODEL PACK FAILED
+    pause
+    exit /b 1
 )
-
-echo ==============================
-echo ESP-IDF build + flash
-echo Project: %PROJECT_DIR%
-echo Port:    %ESP_PORT%
-echo ==============================
 echo.
 
-echo [1/2] Building firmware...
-"%IDF_PYTHON%" "%IDF_PY%" -C "%PROJECT_DIR%" build
-if errorlevel 1 goto fail
+rem ---------- Step 3: Flash ----------
+echo [3/3] Flashing to %ESP_PORT% at %ESP_BAUD% baud...
+"%PYTHON%" "%IDF_TOOLS%\frameworks\esp-idf-v5.1.2\components\esptool_py\esptool\esptool.py" -p %ESP_PORT% -b %ESP_BAUD% --before default_reset --after hard_reset --chip esp32s3 write_flash --flash_mode dio --flash_freq 80m --flash_size 16MB 0x0 "%PROJ%\build\bootloader\bootloader.bin" 0x8000 "%PROJ%\build\partition_table\partition-table.bin" 0x10000 "%PROJ%\build\pump_control.bin" 0x510000 "%PROJ%\build\srmodels\srmodels.bin"
+if errorlevel 1 goto flash_fail
 
 echo.
-echo [2/2] Flashing firmware to %ESP_PORT%...
-"%IDF_PYTHON%" "%IDF_PY%" -C "%PROJECT_DIR%" -p "%ESP_PORT%" flash
-if errorlevel 1 goto fail
-
-echo.
-echo Done.
-if "%NO_PAUSE%" neq "1" pause
+echo ============================================
+echo   Done. ESP32 restarting...
+echo ============================================
+pause
 exit /b 0
 
-:fail
-set "ERR=%errorlevel%"
-if "%ERR%"=="0" set "ERR=1"
+:flash_fail
 echo.
-echo Failed with code %ERR%.
-echo If %ESP_PORT% is busy, close the serial monitor and rerun this script.
-if "%NO_PAUSE%" neq "1" pause
-exit /b %ERR%
+echo FLASH FAILED - Is %ESP_PORT% busy?
+echo Close serial monitor and retry.
+pause
+exit /b 1

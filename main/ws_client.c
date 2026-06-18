@@ -124,13 +124,9 @@ static void audio_player_task(void *arg)
             continue;
         }
 
-        // NULL 数据 = 流结束信号，销毁解码器
+        // NULL 数据 = 流结束信号，只排空不销毁解码器
         if (chunk.data == NULL) {
-            if (decoder) {
-                opus_decoder_destroy(decoder);
-                decoder = NULL;
-            }
-            // 排空 I2S DMA 缓冲区后再关 TX
+            // ★ xiaozhi: 不销毁解码器——冷启动首帧易出 -4，整个对话 session 复用
             if (played_frames > 0) {
                 vTaskDelay(pdMS_TO_TICKS(AUDIO_PLAYBACK_DRAIN_MS));
                 played_frames = 0;

@@ -28,6 +28,9 @@ void audio_out_play_test_tone(void);
 /** 获取 I2S RX 通道句柄（供 audio_in 使用）。 */
 i2s_chan_handle_t audio_out_get_rx_chan(void);
 
+/** AEC 参考信号：读最近 N 个发往喇叭的 mono 样本。返回实际读到的数量。 */
+int audio_out_read_ref(int16_t *out, int want);
+
 #ifdef __cplusplus
 }
 #endif

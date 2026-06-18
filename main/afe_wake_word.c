@@ -1,6 +1,7 @@
 #include "afe_wake_word.h"
 #include "audio_out.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_afe_sr_iface.h"
@@ -117,7 +118,19 @@ static void afe_feed_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "feed task started, chunk=%d", s_feed_chunksize);
+    // AEC 参考信号缓冲
+    int16_t *ref_buf = heap_caps_malloc(s_feed_chunksize * sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!ref_buf) {
+        ref_buf = malloc(s_feed_chunksize * sizeof(int16_t));
+    }
+    if (!ref_buf) {
+        ESP_LOGE(TAG, "ref_buf malloc failed");
+        free(feed_buf);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "feed task started, chunk=%d ch=%d aec=%d", s_feed_chunksize, ch, ch >= 2);
 
     // DMA 累积缓冲：每帧 511×2×4=4088 bytes (32-bit stereo I2S, 驱动限制511帧)
     const int dma_frame_num    = 511;  // 对齐 audio_out.c DMA_FRAME_NUM
@@ -153,13 +166,16 @@ static void afe_feed_task(void *arg)
         // 累积够一帧 → 提取 mono 16-bit → feed
         if (acc_samples >= s_feed_chunksize) {
             cycle++;
+            // ★ AEC：读参考信号（喇叭播放内容），与麦克风数据同步交织
+            audio_out_read_ref(ref_buf, s_feed_chunksize);
+
             memset(feed_buf, 0, feed_bytes);
             for (int i = 0; i < s_feed_chunksize; i++) {
                 // INMP441: 24-bit 左对齐在 32-bit slot → 取高 16bit
                 int16_t mic = (int16_t)(acc[i * 2] >> 16);
                 feed_buf[i * ch] = mic;
                 if (ch >= 2) {
-                    feed_buf[i * ch + 1] = mic;
+                    feed_buf[i * ch + 1] = ref_buf[i];  // 参考 = 喇叭输出
                 }
             }
 
@@ -287,8 +303,8 @@ int afe_wake_word_init(wake_word_callback_t cb)
         return -1;
     }
 
-    // 3. 创建 AFE 配置（单麦 M，无参考通道）
-    afe_config_t *cfg = afe_config_init("M", models,
+    // 3. 创建 AFE 配置（MR = 1 麦克风 + 1 参考通道，用于 AEC）
+    afe_config_t *cfg = afe_config_init("MR", models,
                                         AFE_TYPE_SR, AFE_MODE_HIGH_PERF);
     if (!cfg) {
         ESP_LOGE(TAG, "afe_config_init failed");
@@ -299,7 +315,7 @@ int afe_wake_word_init(wake_word_callback_t cb)
     cfg->wakenet_model_name = wn_name;
     cfg->wakenet_init       = true;
     cfg->wakenet_mode       = DET_MODE_95;
-    cfg->aec_init           = false;
+    cfg->aec_init           = true;   // ★ xiaozhi：开回声消除
     cfg->se_init            = false;
     cfg->ns_init            = false;
     cfg->vad_init           = true;
@@ -337,7 +353,7 @@ int afe_wake_word_init(wake_word_callback_t cb)
     }
 
     // 7. 降到最低阈值（提高灵敏度）
-    s_afe_handle->set_wakenet_threshold(s_afe_data, 1, 0.1f);
+    s_afe_handle->set_wakenet_threshold(s_afe_data, 1, 0.5f);  // 开 AEC 后调回默认，避免噪声误触发
 
     // 8. 查询 feed/fetch 参数
     s_feed_channels   = s_afe_handle->get_channel_num(s_afe_data);
@@ -352,22 +368,38 @@ int afe_wake_word_init(wake_word_callback_t cb)
     afe_config_free(cfg);
 
     // Start fetch before feed so AFE has a reader before microphone frames arrive.
-    BaseType_t fetch_ret = xTaskCreate(afe_fetch_task, "afe_fetch",
-                                       AFE_FETCH_TASK_STACK_BYTES, NULL,
-                                       AFE_FETCH_TASK_PRIORITY, NULL);
+    // ★ xiaozhi 做法：AEC 吃 DRAM，AFE 内部栈走 PSRAM
+    BaseType_t fetch_ret = xTaskCreateWithCaps(afe_fetch_task, "afe_fetch",
+                                                AFE_FETCH_TASK_STACK_BYTES, NULL,
+                                                AFE_FETCH_TASK_PRIORITY, NULL,
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (fetch_ret != pdPASS) {
+        // PSRAM 不够，回退内部 DRAM
+        fetch_ret = xTaskCreate(afe_fetch_task, "afe_fetch",
+                               AFE_FETCH_TASK_STACK_BYTES, NULL,
+                               AFE_FETCH_TASK_PRIORITY, NULL);
+    }
     if (fetch_ret != pdPASS) {
         ESP_LOGE(TAG, "afe_fetch task create failed: %ld", (long)fetch_ret);
         return -1;
     }
 
-    BaseType_t feed_ret = xTaskCreatePinnedToCore(afe_feed_task, "afe_feed",
-                                                 AFE_FEED_TASK_STACK_BYTES, NULL,
-                                                 AFE_FEED_TASK_PRIORITY, NULL,
-                                                 AFE_FEED_TASK_CORE);
+    BaseType_t feed_ret = xTaskCreateWithCaps(afe_feed_task, "afe_feed",
+                                               AFE_FEED_TASK_STACK_BYTES, NULL,
+                                               AFE_FEED_TASK_PRIORITY, NULL,
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (feed_ret != pdPASS) {
+        feed_ret = xTaskCreate(afe_feed_task, "afe_feed",
+                              AFE_FEED_TASK_STACK_BYTES, NULL,
+                              AFE_FEED_TASK_PRIORITY, NULL);
+    }
     if (feed_ret != pdPASS) {
         ESP_LOGE(TAG, "afe_feed task create failed: %ld", (long)feed_ret);
         return -1;
     }
+
+    // ★ AEC 暖启动：前 3 秒滤波器未收敛，禁用唤醒词
+    s_cooldown = 200;  // 200 个 fetch 周期 ≈ 3.2 秒
 
     ESP_LOGI(TAG, "AFE pipeline started, listening...");
     return 0;
