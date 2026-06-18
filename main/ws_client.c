@@ -41,6 +41,41 @@ typedef struct {
 
 
 // ============================================================
+static bool enqueue_opus_frame(const uint8_t *data, size_t len, const char *source)
+{
+    if (!data || len == 0 || len >= 4096) {
+        s_tts_chunks_dropped++;
+        ESP_LOGW(TAG, "Invalid TTS opus frame from %s: len=%u dropped=%lu",
+                 source ? source : "unknown", (unsigned)len,
+                 (unsigned long)s_tts_chunks_dropped);
+        return false;
+    }
+
+    uint8_t *opus_data = malloc(len);
+    if (!opus_data) {
+        s_tts_chunks_dropped++;
+        ESP_LOGW(TAG, "TTS opus frame malloc failed from %s: len=%u dropped=%lu",
+                 source ? source : "unknown", (unsigned)len,
+                 (unsigned long)s_tts_chunks_dropped);
+        return false;
+    }
+    memcpy(opus_data, data, len);
+
+    audio_chunk_t chunk = { .data = opus_data, .len = len };
+    if (xQueueSend(s_audio_queue, &chunk,
+                   pdMS_TO_TICKS(AUDIO_QUEUE_SEND_TIMEOUT_MS)) == pdTRUE) {
+        s_tts_chunks_queued++;
+        return true;
+    }
+
+    free(opus_data);
+    s_tts_chunks_dropped++;
+    ESP_LOGW(TAG, "TTS audio queue full from %s, drop=%lu queued=%lu waiting=%u",
+             source ? source : "unknown", (unsigned long)s_tts_chunks_dropped,
+             (unsigned long)s_tts_chunks_queued,
+             s_audio_queue ? (unsigned)uxQueueMessagesWaiting(s_audio_queue) : 0);
+    return false;
+}
 //  音频播放任务 —— 独立栈，不阻塞 WebSocket
 //  负责：Opus 解码 → Mono→Stereo → I2S 输出
 // ============================================================
@@ -138,6 +173,7 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
 
     case WEBSOCKET_EVENT_DISCONNECTED:
         s_connected = false;
+
         s_tts_active = false;
         ESP_LOGW(TAG, "WebSocket disconnected");
         // 通知 audio task 重置解码器
@@ -148,6 +184,19 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
         break;
 
     case WEBSOCKET_EVENT_DATA:
+        if (data->op_code == 0x02 && data->data_len > 0) {
+            if (!s_tts_active) {
+                s_tts_chunks_dropped++;
+                ESP_LOGW(TAG, "TTS binary frame while inactive: len=%d dropped=%lu",
+                         data->data_len, (unsigned long)s_tts_chunks_dropped);
+                break;
+            }
+            enqueue_opus_frame((const uint8_t *)data->data_ptr,
+                               (size_t)data->data_len,
+                               "binary");
+            break;
+        }
+
         if (data->op_code == 0x01 && data->data_len > 0) {
             cJSON *json = cJSON_ParseWithLength(data->data_ptr, data->data_len);
             if (!json) break;
@@ -159,6 +208,7 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
                     s_tts_active = true;
                     s_turn_done = false;
                     s_pending_dialog_end = false;
+
                     s_tts_chunks_queued = 0;
                     s_tts_chunks_dropped = 0;
                     cJSON *text = cJSON_GetObjectItem(json, "text");
