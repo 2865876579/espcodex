@@ -24,9 +24,13 @@ void afe_capture_start(int max_samples);
 
 /** 取回录音数据 + 实际 sample 数，调用者负责 free(3) */
 int16_t *afe_capture_finish(int *out_samples);
+int afe_capture_samples(void);
+int afe_capture_read_from(int sample_offset, int16_t *out, int max_samples);
 
 /** 录音是否完成（已满、超时无语音、或说话结束） */
 bool afe_capture_is_done(void);
+
+bool afe_capture_seen_speech(void);
 
 /** 本轮录音是否被 VAD 判定包含语音 */
 bool afe_capture_had_speech(void);

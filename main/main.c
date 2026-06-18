@@ -32,8 +32,7 @@
 
 #define WAKE_TRIGGER_TEXT "__wake__"
 #define WS_READY_TIMEOUT_MS 10000
-#define WS_RESTART_INTERVAL_MS 15000
-#define WAKE_REPLY_TIMEOUT_MS 30000
+#define WS_RESTART_INTERVAL_MS 5000
 #define TURN_REPLY_TIMEOUT_MS 60000
 #define NO_SPEECH_DELAY_MS 250
 #define ENABLE_UART_TEXT_INPUT 0
@@ -43,19 +42,16 @@
 #define SPEECH_ACTIVE_LEVEL 500
 #define SPEECH_ACTIVE_MIN_SAMPLES (SAMPLE_RATE / 20)
 
-#define TRIM_FRAME_SAMPLES (SAMPLE_RATE * 30 / 1000)
-#define TRIM_PRE_SAMPLES   (SAMPLE_RATE * 200 / 1000)
-#define TRIM_POST_SAMPLES  (SAMPLE_RATE * 300 / 1000)
-#define TRIM_AC_AVG_THRESHOLD 260
-#define TRIM_PEAK_THRESHOLD   1800
-#define TRIM_ACTIVE_LEVEL     700
-
 static const char *TAG = "app";
 
 static volatile bool s_wake_event = false;
 static volatile bool s_dialog_active = false;
 static QueueHandle_t s_opus_upload_queue = NULL;
 static TaskHandle_t s_opus_upload_task = NULL;
+
+// 借鉴 xiaozhi：保护 AFE capture 状态的 spinlock，防止 fetch 任务
+// 和主循环同时访问 capture buffer 造成 use-after-free
+static portMUX_TYPE s_capture_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
 typedef enum {
     RECORD_SENT,
@@ -96,6 +92,7 @@ static bool wait_for_ws_connected(int timeout_ms)
 static turn_wait_result_t wait_for_turn_result(int timeout_ms)
 {
     int waited = 0;
+    int last_ping = -1000;  // 负值确保首发立即 ping
     while (waited < timeout_ms) {
         if (ws_client_consume_dialog_end()) {
             return TURN_DIALOG_END;
@@ -108,6 +105,11 @@ static turn_wait_result_t wait_for_turn_result(int timeout_ms)
         }
         if (!ws_client_is_connected()) {
             return TURN_WS_LOST;
+        }
+        // ★ 借鉴 xiaozhi：每 2 秒发应用层 ping，强制 WebSocket 有数据流，防云 SLB 杀连接
+        if (waited - last_ping >= 1000) {
+            ws_client_send_raw("{\"type\":\"ping\"}");
+            last_ping = waited;
         }
         vTaskDelay(pdMS_TO_TICKS(100));
         waited += 100;
@@ -158,81 +160,6 @@ static bool pcm_has_speech(const int16_t *pcm, int samples,
         || (peak >= SPEECH_PEAK_THRESHOLD && active >= SPEECH_ACTIVE_MIN_SAMPLES);
 }
 
-static bool pcm_frame_has_speech(const int16_t *pcm, int samples)
-{
-    if (!pcm || samples <= 0) {
-        return false;
-    }
-
-    int64_t sum = 0;
-    for (int index = 0; index < samples; index++) {
-        sum += pcm[index];
-    }
-    int dc = (int)(sum / samples);
-
-    int64_t ac_sum = 0;
-    int peak = 0;
-    int active = 0;
-    for (int index = 0; index < samples; index++) {
-        int delta = (int)pcm[index] - dc;
-        int abs_delta = delta >= 0 ? delta : -delta;
-        ac_sum += abs_delta;
-        if (abs_delta > peak) {
-            peak = abs_delta;
-        }
-        if (abs_delta >= TRIM_ACTIVE_LEVEL) {
-            active++;
-        }
-    }
-
-    int ac_avg = (int)(ac_sum / samples);
-    int min_active = samples / 24;
-    if (min_active < 8) {
-        min_active = 8;
-    }
-
-    return ac_avg >= TRIM_AC_AVG_THRESHOLD
-        || (peak >= TRIM_PEAK_THRESHOLD && active >= min_active);
-}
-
-static bool pcm_find_speech_bounds(const int16_t *pcm, int samples,
-                                   int *out_start, int *out_count)
-{
-    int first = -1;
-    int last = -1;
-    for (int frame_start = 0; frame_start < samples; frame_start += TRIM_FRAME_SAMPLES) {
-        int frame_samples = samples - frame_start;
-        if (frame_samples > TRIM_FRAME_SAMPLES) {
-            frame_samples = TRIM_FRAME_SAMPLES;
-        }
-        if (pcm_frame_has_speech(pcm + frame_start, frame_samples)) {
-            if (first < 0) {
-                first = frame_start;
-            }
-            last = frame_start + frame_samples;
-        }
-    }
-
-    if (first < 0 || last <= first) {
-        return false;
-    }
-
-    int start = first - TRIM_PRE_SAMPLES;
-    if (start < 0) {
-        start = 0;
-    }
-    int end = last + TRIM_POST_SAMPLES;
-    if (end > samples) {
-        end = samples;
-    }
-    if (end <= start) {
-        return false;
-    }
-
-    *out_start = start;
-    *out_count = end - start;
-    return true;
-}
 static bool send_opus_upload(const opus_upload_job_t *job)
 {
     const int16_t *send_pcm = job->pcm + job->trim_start;
@@ -249,14 +176,11 @@ static bool send_opus_upload(const opus_upload_job_t *job)
     opus_encoder_ctl(encoder, OPUS_SET_VBR(1));
     opus_encoder_ctl(encoder, OPUS_SET_DTX(1));
 
-    char start_json[160];
-    snprintf(start_json, sizeof(start_json),
-             "{\"type\":\"audio_start\",\"codec\":\"opus\",\"sample_rate\":%d,\"channels\":1,\"frame_duration_ms\":60,\"samples\":%d}",
-             SAMPLE_RATE, job->trim_samples);
-
+    // ★ 借鉴 xiaozhi：先发 start，让服务器进入实时音频处理模式
+    const char *start_json = "{\"type\":\"listen\",\"state\":\"start\",\"mode\":\"auto\"}";
     bool sent = ws_client_send_raw(start_json);
     if (!sent) {
-        ESP_LOGE(TAG, "audio_start send failed");
+        ESP_LOGE(TAG, "listen start send failed");
     }
 
     uint8_t opus_packet[OPUS_MAX_PACKET_BYTES];
@@ -273,7 +197,6 @@ static bool send_opus_upload(const opus_upload_job_t *job)
 
     int chunks = 0;
     int opus_bytes = 0;
-    UBaseType_t start_watermark = uxTaskGetStackHighWaterMark(NULL);
 
     for (int offset = 0; sent && offset < job->trim_samples; offset += OPUS_FRAME_SAMPLES) {
         int frame_samples = job->trim_samples - offset;
@@ -303,24 +226,21 @@ static bool send_opus_upload(const opus_upload_job_t *job)
 
     char end_json[96];
     snprintf(end_json, sizeof(end_json),
-             "{\"type\":\"audio_end\",\"codec\":\"opus\",\"chunks\":%d,\"bytes\":%d}",
+             "{\"type\":\"listen\",\"state\":\"stop\",\"chunks\":%d,\"bytes\":%d}",
              chunks, opus_bytes);
     if (sent) {
         sent = ws_client_send_raw(end_json);
         if (!sent) {
-            ESP_LOGE(TAG, "audio_end send failed");
+            ESP_LOGE(TAG, "listen stop send failed");
         }
     }
 
-    UBaseType_t end_watermark = uxTaskGetStackHighWaterMark(NULL);
     free(pad_frame);
     opus_encoder_destroy(encoder);
 
-    ESP_LOGI(TAG,
-             "Send audio: opus_frames=%d opus_bytes=%d pcm_samples=%d ac_avg=%d peak=%d active=%d stack_hw=%u->%u",
-             chunks, opus_bytes, job->trim_samples, job->ac_avg, job->peak, job->active,
-             (unsigned)start_watermark, (unsigned)end_watermark);
-
+    if (chunks > 0) {
+        ESP_LOGI(TAG, "audio sent: %d frames, %d bytes", chunks, opus_bytes);
+    }
     return sent;
 }
 
@@ -337,11 +257,7 @@ static void opus_upload_task(void *arg)
         bool sent = false;
         if (job.pcm && ws_client_is_connected()) {
             sent = send_opus_upload(&job);
-        } else {
-            ESP_LOGW(TAG, "opus upload skipped: pcm=%p connected=%d",
-                     job.pcm, ws_client_is_connected() ? 1 : 0);
         }
-
         free(job.pcm);
         if (job.waiter) {
             xTaskNotify(job.waiter, sent ? OPUS_UPLOAD_OK : OPUS_UPLOAD_FAILED, eSetValueWithOverwrite);
@@ -377,51 +293,41 @@ static bool start_opus_upload_task(void)
         return false;
     }
 
-    ESP_LOGI(TAG, "opus upload task started, stack=%d bytes", OPUS_UPLOAD_STACK_BYTES);
     return true;
 }
 
 static record_result_t record_and_send(void)
 {
     int total = SAMPLE_RATE * REC_MAX_DURATION_MS / 1000;
+    int waited_ms = 0;
+    int last_keepalive_ms = -1000;  // 首发立即 ping
 
-    ESP_LOGI(TAG, "Recording (max %dms, auto-stop on silence)...", REC_MAX_DURATION_MS);
     afe_capture_start(total);
     while (!afe_capture_is_done()) {
         vTaskDelay(pdMS_TO_TICKS(50));
+        waited_ms += 50;
+        // ★ 录音期间每 2 秒发 ping，防止云 SLB 杀空闲连接
+        if (waited_ms - last_keepalive_ms >= 2000) {
+            ws_client_send_raw("{\"type\":\"ping\"}");
+            last_keepalive_ms = waited_ms;
+        }
     }
 
     bool vad_had_speech = afe_capture_had_speech();
     int samples = 0;
     int16_t *pcm = afe_capture_finish(&samples);
-    ESP_LOGI(TAG, "Record done: %d samples vad_speech=%d", samples, vad_had_speech ? 1 : 0);
 
     if (!pcm || samples < SAMPLE_RATE / 2) {
         ESP_LOGW(TAG, "Record too short, skip");
         free(pcm);
         return RECORD_FAILED;
     }
-    if (!vad_had_speech) {
-        ESP_LOGI(TAG, "No VAD speech, skip upload");
-        free(pcm);
-        return RECORD_NO_SPEECH;
-    }
 
-    int trim_start = 0;
-    int trim_samples = samples;
-    if (pcm_find_speech_bounds(pcm, samples, &trim_start, &trim_samples)) {
-        ESP_LOGI(TAG, "Trim audio: %d -> %d samples (start=%d)", samples, trim_samples, trim_start);
-    } else {
-        ESP_LOGW(TAG, "Speech bounds not found, keep full record");
-    }
-
-    const int16_t *send_pcm = pcm + trim_start;
     int ac_avg = 0;
     int peak = 0;
     int active = 0;
-    if (!pcm_has_speech(send_pcm, trim_samples, &ac_avg, &peak, &active)) {
-        ESP_LOGI(TAG, "No speech, skip upload: ac_avg=%d peak=%d active=%d",
-                 ac_avg, peak, active);
+    bool has_energy = pcm_has_speech(pcm, samples, &ac_avg, &peak, &active);
+    if (!vad_had_speech && !has_energy) {
         free(pcm);
         return RECORD_NO_SPEECH;
     }
@@ -432,13 +338,14 @@ static record_result_t record_and_send(void)
         return RECORD_FAILED;
     }
 
+    // 清除之前的通知
     uint32_t notify_value = 0;
     xTaskNotifyWait(0, UINT32_MAX, &notify_value, 0);
 
     opus_upload_job_t job = {
         .pcm = pcm,
-        .trim_start = trim_start,
-        .trim_samples = trim_samples,
+        .trim_start = 0,
+        .trim_samples = samples,
         .ac_avg = ac_avg,
         .peak = peak,
         .active = active,
@@ -458,38 +365,31 @@ static record_result_t record_and_send(void)
 
     return notify_value == OPUS_UPLOAD_OK ? RECORD_SENT : RECORD_FAILED;
 }
+
 static void run_dialog(void)
 {
     s_dialog_active = true;
     s_wake_event = false;
 
-    ESP_LOGI(TAG, "Wake word accepted, entering dialog");
+    printf("\n[唤醒] 你好小智 → 进入对话\n");
     if (!wait_for_ws_connected(WS_READY_TIMEOUT_MS)) {
-        ESP_LOGW(TAG, "WebSocket not ready, dialog canceled");
         s_dialog_active = false;
         return;
     }
 
     ws_client_clear_events();
-    if (!ws_client_send_text(WAKE_TRIGGER_TEXT)) {
-        ESP_LOGW(TAG, "Wake trigger send failed");
-        s_dialog_active = false;
-        return;
-    }
+    ws_client_send_raw("{\"type\":\"listen\",\"state\":\"detect\",\"text\":\"你好小智\"}");
 
-    turn_wait_result_t wake_result = wait_for_turn_result(WAKE_REPLY_TIMEOUT_MS);
-    if (wake_result == TURN_DIALOG_END || wake_result == TURN_WS_LOST) {
-        ESP_LOGI(TAG, "Dialog ended during wake reply");
+    // 等服务器问候语（tts start 已占住连接，音频帧随后就到）
+    turn_wait_result_t wake_result = wait_for_turn_result(3000);
+    if (wake_result == TURN_WS_LOST) {
         s_dialog_active = false;
         return;
     }
-    if (wake_result == TURN_TIMEOUT) {
-        ESP_LOGW(TAG, "Wake reply timeout, continue listening");
-    }
+    // timeout 或 turn_done：继续录音
 
     while (s_dialog_active) {
         if (!wait_for_ws_connected(WS_READY_TIMEOUT_MS)) {
-            ESP_LOGW(TAG, "WebSocket lost, exit dialog");
             break;
         }
 
@@ -500,28 +400,22 @@ static void run_dialog(void)
             continue;
         }
         if (rec == RECORD_FAILED) {
-            ESP_LOGW(TAG, "Record/send failed, exit dialog");
             break;
         }
 
         turn_wait_result_t result = wait_for_turn_result(TURN_REPLY_TIMEOUT_MS);
         if (result == TURN_DIALOG_END) {
-            ESP_LOGI(TAG, "Exit dialog by cloud command");
+            printf("[对话结束]\n\n");
             break;
         }
-        if (result == TURN_WS_LOST) {
-            ESP_LOGW(TAG, "WebSocket disconnected during turn");
+        if (result == TURN_WS_LOST || result == TURN_TIMEOUT) {
             break;
-        }
-        if (result == TURN_TIMEOUT) {
-            ESP_LOGW(TAG, "Cloud reply timeout, continue listening");
         }
     }
 
     ws_client_clear_events();
     s_wake_event = false;
     s_dialog_active = false;
-    ESP_LOGI(TAG, "Dialog stopped, waiting for wake word");
 }
 
 static void on_wake_word(void)
@@ -533,12 +427,10 @@ static void on_wake_word(void)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "=== smart pillow firmware start ===");
+    printf("\n========== 智能枕头 v1.0 ==========\n\n");
     if (!start_opus_upload_task()) {
-        ESP_LOGE(TAG, "Opus upload task init failed");
-        while (1) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
+        ESP_LOGE(TAG, "Opus task init failed");
+        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
     audio_out_init();
 
@@ -553,25 +445,20 @@ void app_main(void)
     uart_param_config(UART_NUM_0, &uart_cfg);
 
     if (wifi_connect(WIFI_SSID, WIFI_PASS) != 0) {
-        ESP_LOGE(TAG, "WiFi connect failed");
-        while (1) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
+        ESP_LOGE(TAG, "WiFi failed");
+        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
-    ESP_LOGI(TAG, "WiFi connected");
 
     ws_client_start(WS_URI);
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     if (afe_wake_word_init(on_wake_word) != 0) {
-        ESP_LOGE(TAG, "AFE wake word init failed");
-        while (1) {
-            vTaskDelay(pdMS_TO_TICKS(1000));
-        }
+        ESP_LOGE(TAG, "AFE init failed");
+        while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
     vTaskDelay(pdMS_TO_TICKS(1500));
 
-    ESP_LOGI(TAG, "Ready. Say wake word to start dialog");
+    printf("[就绪] 说 '你好小智' 唤醒\n\n");
 
     uint8_t rx_buf[128];
     TickType_t last_ws_restart = xTaskGetTickCount();
@@ -607,18 +494,9 @@ void app_main(void)
 #if ENABLE_UART_TEXT_INPUT
                 if (strncmp(cmd, "text:", 5) == 0) {
                     char *payload = cmd + 5;
-                    while (*payload == ' ') {
-                        payload++;
-                    }
-                    if (*payload) {
-                        ESP_LOGI(TAG, "UART text command received (%d bytes)", (int)strlen(payload));
-                        ws_client_send_text(payload);
-                    }
-                } else {
-                    ESP_LOGI(TAG, "UART input ignored (%d bytes)", (int)strlen(cmd));
+                    while (*payload == ' ') payload++;
+                    if (*payload) ws_client_send_text(payload);
                 }
-#else
-                ESP_LOGI(TAG, "UART input ignored (%d bytes)", (int)strlen(cmd));
 #endif
             }
         }

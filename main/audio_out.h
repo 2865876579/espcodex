@@ -15,6 +15,10 @@ extern "C" {
  */
 void audio_out_init(void);
 
+/** 打开/关闭 I2S TX。默认上电保持关闭，避免 MAX98357A 空闲噪声。 */
+void audio_out_start(void);
+void audio_out_stop(void);
+
 /** 写 PCM 数据到 I2S 输出（阻塞直到写完）。 */
 void audio_out_write(const uint8_t *data, size_t len);
 

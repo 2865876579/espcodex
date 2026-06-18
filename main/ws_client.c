@@ -25,6 +25,10 @@ static QueueHandle_t s_audio_queue = NULL;  // 音频数据队列（WebSocket �
 static volatile uint32_t s_tts_chunks_queued = 0;
 static volatile uint32_t s_tts_chunks_dropped = 0;
 
+// 借鉴 xiaozhi：用 spinlock 保护 consume 操作的原子性，避免 WebSocket 任务
+// 和主循环同时 consume 标志位时丢失事件
+static portMUX_TYPE s_event_spinlock = portMUX_INITIALIZER_UNLOCKED;
+
 #define OPUS_SAMPLE_RATE    16000
 #define OPUS_CHANNELS       1
 #define AUDIO_QUEUE_DEPTH   512
@@ -39,24 +43,46 @@ typedef struct {
     size_t   len;
 } audio_chunk_t;
 
+static void begin_tts_stream(void)
+{
+    s_tts_active = true;
+    s_turn_done = false;
+    s_pending_dialog_end = false;
+    s_tts_chunks_queued = 0;
+    s_tts_chunks_dropped = 0;
+}
+
+static void end_tts_stream(bool dialog_end)
+{
+    if (dialog_end) {
+        s_pending_dialog_end = true;
+    }
+
+    audio_chunk_t end = { .data = NULL, .len = 0 };
+    if (xQueueSend(s_audio_queue, &end,
+                   pdMS_TO_TICKS(AUDIO_END_SEND_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGE(TAG, "TTS end marker enqueue failed");
+        if (s_pending_dialog_end) {
+            s_dialog_end = true;
+            s_pending_dialog_end = false;
+        }
+        s_tts_active = false;
+        s_turn_done = true;
+    }
+}
+
 
 // ============================================================
 static bool enqueue_opus_frame(const uint8_t *data, size_t len, const char *source)
 {
     if (!data || len == 0 || len >= 4096) {
         s_tts_chunks_dropped++;
-        ESP_LOGW(TAG, "Invalid TTS opus frame from %s: len=%u dropped=%lu",
-                 source ? source : "unknown", (unsigned)len,
-                 (unsigned long)s_tts_chunks_dropped);
         return false;
     }
 
     uint8_t *opus_data = malloc(len);
     if (!opus_data) {
         s_tts_chunks_dropped++;
-        ESP_LOGW(TAG, "TTS opus frame malloc failed from %s: len=%u dropped=%lu",
-                 source ? source : "unknown", (unsigned)len,
-                 (unsigned long)s_tts_chunks_dropped);
         return false;
     }
     memcpy(opus_data, data, len);
@@ -70,14 +96,11 @@ static bool enqueue_opus_frame(const uint8_t *data, size_t len, const char *sour
 
     free(opus_data);
     s_tts_chunks_dropped++;
-    ESP_LOGW(TAG, "TTS audio queue full from %s, drop=%lu queued=%lu waiting=%u",
-             source ? source : "unknown", (unsigned long)s_tts_chunks_dropped,
-             (unsigned long)s_tts_chunks_queued,
-             s_audio_queue ? (unsigned)uxQueueMessagesWaiting(s_audio_queue) : 0);
     return false;
 }
 //  音频播放任务 —— 独立栈，不阻塞 WebSocket
 //  负责：Opus 解码 → Mono→Stereo → I2S 输出
+//  借鉴 xiaozhi：只在有音频数据时才 enable I2S TX，空闲时关闭消除底噪
 // ============================================================
 static void audio_player_task(void *arg)
 {
@@ -88,9 +111,16 @@ static void audio_player_task(void *arg)
     OpusDecoder *decoder = NULL;
     audio_chunk_t chunk;
     int played_frames = 0;
+    bool tx_active = false;     // 跟踪 TX 是否已开启
 
     while (1) {
         if (xQueueReceive(s_audio_queue, &chunk, pdMS_TO_TICKS(5000)) != pdTRUE) {
+            // 长时间无数据 → 关闭 TX 省电+消底噪
+            if (tx_active) {
+                audio_out_stop();
+                tx_active = false;
+                played_frames = 0;
+            }
             continue;
         }
 
@@ -99,21 +129,23 @@ static void audio_player_task(void *arg)
             if (decoder) {
                 opus_decoder_destroy(decoder);
                 decoder = NULL;
-                ESP_LOGI(TAG, "Opus decoder reset");
             }
+            // 排空 I2S DMA 缓冲区后再关 TX
             if (played_frames > 0) {
                 vTaskDelay(pdMS_TO_TICKS(AUDIO_PLAYBACK_DRAIN_MS));
                 played_frames = 0;
+            }
+            if (tx_active) {
+                audio_out_stop();
+                tx_active = false;
             }
             if (s_tts_active) {
                 s_tts_active = false;
                 if (s_pending_dialog_end) {
                     s_dialog_end = true;
                     s_pending_dialog_end = false;
-                    ESP_LOGI(TAG, "Dialog end after playback");
                 }
                 s_turn_done = true;
-                printf("dialog turn done\n");
             }
             continue;
         }
@@ -127,7 +159,6 @@ static void audio_player_task(void *arg)
                 free(chunk.data);
                 continue;
             }
-            ESP_LOGI(TAG, "Opus decoder ready");
         }
 
         // Opus → PCM
@@ -135,11 +166,19 @@ static void audio_player_task(void *arg)
         free(chunk.data);  // 尽早释放
 
         if (samples < 0) {
-            ESP_LOGE(TAG, "Opus decode error: %d", samples);
+            ESP_LOGE(TAG, "Opus decode error: %d, resetting decoder", samples);
+            opus_decoder_destroy(decoder);
+            decoder = NULL;
             continue;
         }
         if (samples == 0) {
             continue;  // FEC 或空帧
+        }
+
+        // ★ 第一帧有效数据 → 开 TX
+        if (!tx_active) {
+            audio_out_start();
+            tx_active = true;
         }
 
         // Mono → Stereo（MAX98357A 接收立体声，只取左声道也能响）
@@ -168,15 +207,21 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
     switch (event_id) {
     case WEBSOCKET_EVENT_CONNECTED:
         s_connected = true;
-        ESP_LOGI(TAG, "WebSocket connected to cloud");
+        printf("[*] 已连接云端\n");
+        {
+            const char *hello_json =
+                "{\"type\":\"hello\",\"version\":1,\"transport\":\"websocket\","
+                "\"audio_params\":{\"format\":\"opus\",\"sample_rate\":16000,"
+                "\"channels\":1,\"frame_duration\":60}}";
+            esp_websocket_client_send_text(s_client, hello_json, strlen(hello_json),
+                                           pdMS_TO_TICKS(1000));
+        }
         break;
 
     case WEBSOCKET_EVENT_DISCONNECTED:
         s_connected = false;
-
         s_tts_active = false;
-        ESP_LOGW(TAG, "WebSocket disconnected");
-        // 通知 audio task 重置解码器
+        // 通知 audio task 重置解码器 + 停止播放
         {
             audio_chunk_t end = { .data = NULL, .len = 0 };
             xQueueSend(s_audio_queue, &end, 0);
@@ -187,8 +232,6 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
         if (data->op_code == 0x02 && data->data_len > 0) {
             if (!s_tts_active) {
                 s_tts_chunks_dropped++;
-                ESP_LOGW(TAG, "TTS binary frame while inactive: len=%d dropped=%lu",
-                         data->data_len, (unsigned long)s_tts_chunks_dropped);
                 break;
             }
             enqueue_opus_frame((const uint8_t *)data->data_ptr,
@@ -205,15 +248,24 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
             if (type && cJSON_IsString(type)) {
 
                 if (strcmp(type->valuestring, "tts_audio_start") == 0) {
-                    s_tts_active = true;
-                    s_turn_done = false;
-                    s_pending_dialog_end = false;
-
-                    s_tts_chunks_queued = 0;
-                    s_tts_chunks_dropped = 0;
-                    cJSON *text = cJSON_GetObjectItem(json, "text");
-                    ESP_LOGI(TAG, "TTS text received, len=%d",
-                             (text && cJSON_IsString(text)) ? (int)strlen(text->valuestring) : 0);
+                    begin_tts_stream();
+                }
+                else if (strcmp(type->valuestring, "tts") == 0) {
+                    cJSON *state = cJSON_GetObjectItem(json, "state");
+                    if (state && cJSON_IsString(state)) {
+                        if (strcmp(state->valuestring, "start") == 0) {
+                            begin_tts_stream();
+                        } else if (strcmp(state->valuestring, "stop") == 0) {
+                            cJSON *dialog_end = cJSON_GetObjectItem(json, "dialog_end");
+                            end_tts_stream(dialog_end && cJSON_IsTrue(dialog_end));
+                        } else if (strcmp(state->valuestring, "sentence_start") == 0) {
+                            // ★ 流式显示 AI 回复文本
+                            cJSON *text = cJSON_GetObjectItem(json, "text");
+                            if (text && cJSON_IsString(text)) {
+                                printf("[小眠] %s\n", text->valuestring);
+                            }
+                        }
+                    }
                 }
                 else if (strcmp(type->valuestring, "tts_audio_chunk") == 0) {
                     cJSON *audio = cJSON_GetObjectItem(json, "audio");
@@ -237,10 +289,6 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
                                     opus_data = NULL;
                                 } else {
                                     s_tts_chunks_dropped++;
-                                    ESP_LOGW(TAG, "TTS audio queue full, drop=%lu queued=%lu waiting=%u",
-                                             (unsigned long)s_tts_chunks_dropped,
-                                             (unsigned long)s_tts_chunks_queued,
-                                             s_audio_queue ? (unsigned)uxQueueMessagesWaiting(s_audio_queue) : 0);
                                 }
                                 free(opus_data);
                             }
@@ -248,46 +296,24 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
                     }
                 }
                 else if (strcmp(type->valuestring, "tts_audio_end") == 0) {
-                    cJSON *chunks_json = cJSON_GetObjectItem(json, "chunks");
-                    int total = chunks_json ? chunks_json->valueint : 0;
                     cJSON *dialog_end = cJSON_GetObjectItem(json, "dialog_end");
-                    if (dialog_end && cJSON_IsTrue(dialog_end)) {
-                        s_pending_dialog_end = true;
-                        ESP_LOGI(TAG, "Dialog end requested by cloud");
-                    }
-                    ESP_LOGI(TAG, "TTS end rx (%d frames queued=%lu dropped=%lu waiting=%u)",
-                             total,
-                             (unsigned long)s_tts_chunks_queued,
-                             (unsigned long)s_tts_chunks_dropped,
-                             s_audio_queue ? (unsigned)uxQueueMessagesWaiting(s_audio_queue) : 0);
-
-                    audio_chunk_t end = { .data = NULL, .len = 0 };
-                    if (xQueueSend(s_audio_queue, &end,
-                                   pdMS_TO_TICKS(AUDIO_END_SEND_TIMEOUT_MS)) != pdTRUE) {
-                        ESP_LOGE(TAG, "TTS end marker enqueue failed");
-                        if (s_pending_dialog_end) {
-                            s_dialog_end = true;
-                            s_pending_dialog_end = false;
-                        }
-                        s_turn_done = true;
-                    }
+                    end_tts_stream(dialog_end && cJSON_IsTrue(dialog_end));
                 }
                 else if (strcmp(type->valuestring, "status") == 0) {
                     cJSON *msg = cJSON_GetObjectItem(json, "msg");
-                    ESP_LOGI(TAG, "STATUS received, len=%d",
-                             (msg && cJSON_IsString(msg)) ? (int)strlen(msg->valuestring) : 0);
+                    if (msg && cJSON_IsString(msg)) {
+                        printf("[状态] %s\n", msg->valuestring);
+                    }
                     s_turn_done = true;
                 }
                 else if (strcmp(type->valuestring, "stt_result") == 0) {
                     cJSON *text = cJSON_GetObjectItem(json, "text");
-                    ESP_LOGI(TAG, "STT text received, len=%d",
-                             (text && cJSON_IsString(text)) ? (int)strlen(text->valuestring) : 0);
+                    if (text && cJSON_IsString(text)) {
+                        printf("[你] %s\n", text->valuestring);
+                    }
                 }
                 else if (strcmp(type->valuestring, "dialog_end") == 0) {
-                    s_dialog_end = true;
-                    s_turn_done = true;
-                    s_tts_active = false;
-                    ESP_LOGI(TAG, "Dialog end");
+                    end_tts_stream(true);
                 }
                 else if (strcmp(type->valuestring, "pong") == 0) {
                     // 心跳，忽略
@@ -298,7 +324,6 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
         break;
 
     case WEBSOCKET_EVENT_ERROR:
-        ESP_LOGE(TAG, "WebSocket error");
         break;
 
     default:
@@ -313,11 +338,10 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
 
 void ws_client_start(const char *uri)
 {
-    // 音频队列：深度 256（只存指针，内存开销极小）
+    // 音频队列：深度 512（只存指针，内存开销极小）
     s_audio_queue = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(audio_chunk_t));
 
-    // 音频播放任务：16KB 栈，优先级 5
-    // 音频播放任务：16KB 栈，优先级 4（需要及时取队列 + 写 I2S）
+    // 音频播放任务：24KB 栈，优先级 3（需要及时取队列 + 写 I2S）
     xTaskCreate(audio_player_task, "audio_player", AUDIO_PLAYER_STACK_BYTES, NULL, 3, NULL);
 
     // WebSocket 客户端：16KB 栈（库内部帧解析也需要栈空间！）
@@ -326,8 +350,8 @@ void ws_client_start(const char *uri)
         .buffer_size = 8192,
         .reconnect_timeout_ms = 10000,
         .network_timeout_ms = 15000,
-        .ping_interval_sec = 10,
-        .pingpong_timeout_sec = 0,
+        .ping_interval_sec = 2,           // 每 3 秒发 ping 防止云 SLB 杀空闲连接
+        .pingpong_timeout_sec = 10,       // 10 秒没收到 pong 判定断线
         .disable_auto_reconnect = false,
         .task_stack = 16384,
     };
@@ -335,18 +359,13 @@ void ws_client_start(const char *uri)
     s_client = esp_websocket_client_init(&ws_cfg);
     esp_websocket_register_events(s_client, WEBSOCKET_EVENT_ANY, ws_event_handler, NULL);
     esp_websocket_client_start(s_client);
-
-    ESP_LOGI(TAG, "WebSocket client starting, uri=%s", uri);
 }
 
 
 void ws_client_restart(void)
 {
-    if (!s_client) {
-        return;
-    }
+    if (!s_client) return;
 
-    ESP_LOGW(TAG, "Restarting WebSocket client");
     s_connected = false;
     s_tts_active = false;
     s_turn_done = false;
@@ -358,16 +377,9 @@ void ws_client_restart(void)
         xQueueSend(s_audio_queue, &end, 0);
     }
 
-    esp_err_t stop_ret = esp_websocket_client_stop(s_client);
-    if (stop_ret != ESP_OK) {
-        ESP_LOGW(TAG, "WebSocket stop returned 0x%x", stop_ret);
-    }
+    esp_websocket_client_stop(s_client);
     vTaskDelay(pdMS_TO_TICKS(500));
-
-    esp_err_t start_ret = esp_websocket_client_start(s_client);
-    if (start_ret != ESP_OK) {
-        ESP_LOGW(TAG, "WebSocket restart start returned 0x%x", start_ret);
-    }
+    esp_websocket_client_start(s_client);
 }
 
 bool ws_client_send_text(const char *text)
@@ -384,8 +396,6 @@ bool ws_client_send_text(const char *text)
     int json_len = strlen(json_str);
 
     int sent = esp_websocket_client_send_text(s_client, json_str, json_len, portMAX_DELAY);
-    ESP_LOGI(TAG, "Sent text (%d bytes)", json_len);
-
     free(json_str);
     cJSON_Delete(msg);
     return sent >= 0;
@@ -394,16 +404,13 @@ bool ws_client_send_text(const char *text)
 bool ws_client_send_raw(const char *json_str)
 {
     if (!s_client || !esp_websocket_client_is_connected(s_client)) {
-        ESP_LOGW(TAG, "WebSocket not connected, cannot send");
         return false;
     }
-
     int json_len = strlen(json_str);
-    ESP_LOGI(TAG, "Sending raw JSON (%d bytes)", json_len);
     int sent = esp_websocket_client_send_text(s_client, json_str, json_len, portMAX_DELAY);
-    ESP_LOGI(TAG, "Raw JSON sent (%d bytes)", json_len);
     return sent >= 0;
 }
+
 bool ws_client_send_binary(const uint8_t *data, int len)
 {
     if (!s_client || !esp_websocket_client_is_connected(s_client)) {
@@ -430,21 +437,30 @@ bool ws_client_is_tts_active(void)
 
 void ws_client_clear_events(void)
 {
+    // ★ 借鉴 xiaozhi：临界区保护，防止和 ws_event_handler 同时改标志位
+    portENTER_CRITICAL(&s_event_spinlock);
     s_turn_done = false;
     s_dialog_end = false;
     s_pending_dialog_end = false;
+    portEXIT_CRITICAL(&s_event_spinlock);
 }
 
 bool ws_client_consume_turn_done(void)
 {
+    // ★ 临界区保护原子 consume
+    portENTER_CRITICAL(&s_event_spinlock);
     bool value = s_turn_done;
     s_turn_done = false;
+    portEXIT_CRITICAL(&s_event_spinlock);
     return value;
 }
 
 bool ws_client_consume_dialog_end(void)
 {
+    // ★ 临界区保护原子 consume
+    portENTER_CRITICAL(&s_event_spinlock);
     bool value = s_dialog_end;
     s_dialog_end = false;
+    portEXIT_CRITICAL(&s_event_spinlock);
     return value;
 }
