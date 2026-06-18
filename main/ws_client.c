@@ -72,13 +72,13 @@ static void audio_player_task(void *arg)
             }
             if (s_tts_active) {
                 s_tts_active = false;
-                s_turn_done = true;
-                printf("dialog turn done\n");
                 if (s_pending_dialog_end) {
                     s_dialog_end = true;
                     s_pending_dialog_end = false;
                     ESP_LOGI(TAG, "Dialog end after playback");
                 }
+                s_turn_done = true;
+                printf("dialog turn done\n");
             }
             continue;
         }
@@ -215,6 +215,10 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
                     if (xQueueSend(s_audio_queue, &end,
                                    pdMS_TO_TICKS(AUDIO_END_SEND_TIMEOUT_MS)) != pdTRUE) {
                         ESP_LOGE(TAG, "TTS end marker enqueue failed");
+                        if (s_pending_dialog_end) {
+                            s_dialog_end = true;
+                            s_pending_dialog_end = false;
+                        }
                         s_turn_done = true;
                     }
                 }
