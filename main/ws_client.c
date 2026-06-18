@@ -186,6 +186,11 @@ static void audio_player_task(void *arg)
         // I2S 输出 —— 这个任务可以慢慢等 DMA 空间
         audio_out_write((const uint8_t *)stereo, samples * 4);
         played_frames++;
+
+        // ★ 播放期间每 ~2 秒发 keepalive，防止云 SLB 杀空闲连接
+        if (played_frames % 32 == 0) {
+            ws_client_send_raw("{\"type\":\"ping\"}");
+        }
     }
 }
 
