@@ -14,7 +14,7 @@ static const char *TAG = "audio_out";
 //  借鉴 xiaozhi 项目：两根独立 I2S 总线
 //  I2S0 = TX(喇叭 MAX98357A)
 //  I2S1 = RX(麦克风 INMP441)
-//  ★ TX 默认不 enable，只在播放音频时才开
+//  ★ TX 常开，空闲写静音填充，避免开关跳变产生异响
 // ═══════════════════════════════════════════════════
 
 #define I2S0_BCLK_GPIO   GPIO_NUM_5
@@ -61,6 +61,8 @@ void audio_out_init(void)
         },
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx_chan, &tx_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(s_tx_chan));  // ★ xiaozhi: TX 常开，写静音而非关
+    s_tx_enabled = true;
     gpio_set_drive_capability(I2S0_DOUT_GPIO, GPIO_DRIVE_CAP_0);
 
     // I2S1 RX — INMP441 麦克风
@@ -112,8 +114,6 @@ void audio_out_stop(void)
 void audio_out_write(const uint8_t *data, size_t len)
 {
     if (s_tx_chan == NULL || data == NULL || len == 0) return;
-    if (!s_tx_enabled) audio_out_start();
-
     size_t written = 0;
     i2s_channel_write(s_tx_chan, data, len, &written, portMAX_DELAY);
 

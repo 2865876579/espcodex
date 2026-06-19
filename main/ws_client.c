@@ -100,7 +100,7 @@ static bool enqueue_opus_frame(const uint8_t *data, size_t len, const char *sour
 }
 //  音频播放任务 —— 独立栈，不阻塞 WebSocket
 //  负责：Opus 解码 → Mono→Stereo → I2S 输出
-//  借鉴 xiaozhi：只在有音频数据时才 enable I2S TX，空闲时关闭消除底噪
+//  借鉴 xiaozhi：TX 常开，空闲写静音填充，不产生开关跳变
 // ============================================================
 static void audio_player_task(void *arg)
 {
@@ -114,11 +114,11 @@ static void audio_player_task(void *arg)
     bool tx_active = false;     // 跟踪 TX 是否已开启
 
     while (1) {
-        if (xQueueReceive(s_audio_queue, &chunk, pdMS_TO_TICKS(5000)) != pdTRUE) {
-            // 长时间无数据 → 关闭 TX 省电+消底噪
+        if (xQueueReceive(s_audio_queue, &chunk, pdMS_TO_TICKS(2000)) != pdTRUE) {
+            // ★ xiaozhi: TX 常开，空闲时写静音填充，不产生开关跳变
             if (tx_active) {
-                audio_out_stop();
-                tx_active = false;
+                memset(stereo, 0, sizeof(stereo));
+                audio_out_write((const uint8_t *)stereo, sizeof(stereo));
                 played_frames = 0;
             }
             continue;
@@ -126,15 +126,14 @@ static void audio_player_task(void *arg)
 
         // NULL 数据 = 流结束信号，只排空不销毁解码器
         if (chunk.data == NULL) {
-            // ★ xiaozhi: 不销毁解码器——冷启动首帧易出 -4，整个对话 session 复用
             if (played_frames > 0) {
                 vTaskDelay(pdMS_TO_TICKS(AUDIO_PLAYBACK_DRAIN_MS));
                 played_frames = 0;
             }
-            if (tx_active) {
-                audio_out_stop();
-                tx_active = false;
-            }
+            // ★ 立刻写静音帧覆盖 DMA 尾巴，避免残留音频循环播放
+            memset(stereo, 0, sizeof(stereo));
+            audio_out_write((const uint8_t *)stereo, sizeof(stereo));
+            tx_active = false;
             if (s_tts_active) {
                 s_tts_active = false;
                 if (s_pending_dialog_end) {
@@ -162,20 +161,26 @@ static void audio_player_task(void *arg)
         free(chunk.data);  // 尽早释放
 
         if (samples < 0) {
-            ESP_LOGE(TAG, "Opus decode error: %d, resetting decoder", samples);
-            opus_decoder_destroy(decoder);
-            decoder = NULL;
+            // ★ xiaozhi: FEC → PLC 软降级，不重建解码器，避免卡顿
+            samples = opus_decode(decoder, NULL, 0, pcm, 960, 1);  // FEC 纠错
+        }
+        if (samples < 0) {
+            samples = opus_decode(decoder, NULL, 0, pcm, 960, 0);  // PLC 插值
+        }
+        if (samples < 0) {
+            ESP_LOGE(TAG, "Opus decode error: %d", samples);
             continue;
         }
         if (samples == 0) {
-            continue;  // FEC 或空帧
+            // ★ DTX 空帧/FEC → 用 PLC 插值填充，不跳帧避免 DMA 重复旧数据
+            samples = opus_decode(decoder, NULL, 0, pcm, 960, 0);
+        }
+        if (samples <= 0) {
+            continue;
         }
 
-        // ★ 第一帧有效数据 → 开 TX
-        if (!tx_active) {
-            audio_out_start();
-            tx_active = true;
-        }
+        // TX 已常开，记录播放状态即可
+        tx_active = true;
 
         // Mono → Stereo（MAX98357A 接收立体声，只取左声道也能响）
         for (int i = 0; i < samples; i++) {
@@ -187,10 +192,6 @@ static void audio_player_task(void *arg)
         audio_out_write((const uint8_t *)stereo, samples * 4);
         played_frames++;
 
-        // ★ 播放期间每 ~2 秒发 keepalive，防止云 SLB 杀空闲连接
-        if (played_frames % 32 == 0) {
-            ws_client_send_raw("{\"type\":\"ping\"}");
-        }
     }
 }
 
@@ -342,8 +343,8 @@ void ws_client_start(const char *uri)
     // 音频队列：深度 512（只存指针，内存开销极小）
     s_audio_queue = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(audio_chunk_t));
 
-    // 音频播放任务：24KB 栈，优先级 3（需要及时取队列 + 写 I2S）
-    xTaskCreate(audio_player_task, "audio_player", AUDIO_PLAYER_STACK_BYTES, NULL, 3, NULL);
+    // 音频播放任务：绑 core 1 避让 core 0 的 feed 任务，防 I2S 断流
+    xTaskCreatePinnedToCore(audio_player_task, "audio_player", AUDIO_PLAYER_STACK_BYTES, NULL, 3, NULL, 1);
 
     // WebSocket 客户端：16KB 栈（库内部帧解析也需要栈空间！）
     esp_websocket_client_config_t ws_cfg = {
@@ -352,7 +353,7 @@ void ws_client_start(const char *uri)
         .reconnect_timeout_ms = 10000,
         .network_timeout_ms = 15000,
         .ping_interval_sec = 2,           // 每 3 秒发 ping 防止云 SLB 杀空闲连接
-        .pingpong_timeout_sec = 10,       // 10 秒没收到 pong 判定断线
+        .pingpong_timeout_sec = 0,          // 应用层 keepalive 已覆盖，协议层不管
         .disable_auto_reconnect = false,
         .task_stack = 16384,
     };
