@@ -1,5 +1,6 @@
 #include "audio_out.h"
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -26,7 +27,7 @@ static const char *TAG = "audio_out";
 #define I2S1_DIN_GPIO    GPIO_NUM_3
 
 #define SAMPLE_RATE      16000
-#define DMA_DESC_NUM     4     // xiaozhi: 降低播放延迟，配合 AEC 对齐
+#define DMA_DESC_NUM     8     // 512ms 缓冲，覆盖首帧到达前空档
 #define DMA_FRAME_NUM    511
 
 static i2s_chan_handle_t s_tx_chan = NULL;
@@ -61,9 +62,19 @@ void audio_out_init(void)
         },
     };
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx_chan, &tx_cfg));
-    ESP_ERROR_CHECK(i2s_channel_enable(s_tx_chan));  // ★ xiaozhi: TX 常开，写静音而非关
+    ESP_ERROR_CHECK(i2s_channel_enable(s_tx_chan));
     s_tx_enabled = true;
     gpio_set_drive_capability(I2S0_DOUT_GPIO, GPIO_DRIVE_CAP_0);
+
+    // ★ 预写静音填满 DMA，避免首帧到达前 DMA 循环播残留数据
+    int16_t *silence = calloc(1, DMA_FRAME_NUM * 4);  // stereo 16bit
+    if (silence) {
+        for (int i = 0; i < DMA_DESC_NUM; i++) {
+            size_t w = 0;
+            i2s_channel_write(s_tx_chan, silence, DMA_FRAME_NUM * 4, &w, portMAX_DELAY);
+        }
+        free(silence);
+    }
 
     // I2S1 RX — INMP441 麦克风
     i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);

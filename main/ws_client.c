@@ -343,8 +343,8 @@ void ws_client_start(const char *uri)
     // 音频队列：深度 512（只存指针，内存开销极小）
     s_audio_queue = xQueueCreate(AUDIO_QUEUE_DEPTH, sizeof(audio_chunk_t));
 
-    // 音频播放任务：绑 core 1 避让 core 0 的 feed 任务，防 I2S 断流
-    xTaskCreatePinnedToCore(audio_player_task, "audio_player", AUDIO_PLAYER_STACK_BYTES, NULL, 3, NULL, 1);
+    // 音频播放任务：prio=9 高于 feed(8)，确保 DMA 不断流
+    xTaskCreatePinnedToCore(audio_player_task, "audio_player", AUDIO_PLAYER_STACK_BYTES, NULL, 9, NULL, 1);
 
     // WebSocket 客户端：16KB 栈（库内部帧解析也需要栈空间！）
     esp_websocket_client_config_t ws_cfg = {

@@ -369,12 +369,12 @@ int afe_wake_word_init(wake_word_callback_t cb)
 
     // Start fetch before feed so AFE has a reader before microphone frames arrive.
     // ★ xiaozhi 做法：AEC 吃 DRAM，AFE 内部栈走 PSRAM
+    // fetch: PSRAM 栈（8KB 较大）
     BaseType_t fetch_ret = xTaskCreateWithCaps(afe_fetch_task, "afe_fetch",
                                                 AFE_FETCH_TASK_STACK_BYTES, NULL,
                                                 AFE_FETCH_TASK_PRIORITY, NULL,
                                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (fetch_ret != pdPASS) {
-        // PSRAM 不够，回退内部 DRAM
         fetch_ret = xTaskCreate(afe_fetch_task, "afe_fetch",
                                AFE_FETCH_TASK_STACK_BYTES, NULL,
                                AFE_FETCH_TASK_PRIORITY, NULL);

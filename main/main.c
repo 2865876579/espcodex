@@ -51,7 +51,7 @@ static TaskHandle_t s_opus_upload_task = NULL;
 
 // 借鉴 xiaozhi：保护 AFE capture 状态的 spinlock，防止 fetch 任务
 // 和主循环同时访问 capture buffer 造成 use-after-free
-static portMUX_TYPE s_capture_spinlock = portMUX_INITIALIZER_UNLOCKED;
+static portMUX_TYPE __attribute__((unused)) s_capture_spinlock = portMUX_INITIALIZER_UNLOCKED;
 
 typedef enum {
     RECORD_SENT,
@@ -317,7 +317,7 @@ static record_result_t record_and_send(void)
     int samples = 0;
     int16_t *pcm = afe_capture_finish(&samples);
 
-    if (!pcm || samples < SAMPLE_RATE / 2) {
+    if (!pcm || samples < SAMPLE_RATE / 5) {  // 200ms 门槛，短句子也能录
         ESP_LOGW(TAG, "Record too short, skip");
         free(pcm);
         return RECORD_FAILED;
