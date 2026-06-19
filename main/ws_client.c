@@ -124,7 +124,7 @@ static void audio_player_task(void *arg)
     bool tx_active = false;     // 跟踪 TX 是否已开启
 
     while (1) {
-        if (xQueueReceive(s_audio_queue, &chunk, pdMS_TO_TICKS(50)) != pdTRUE) {
+        if (xQueueReceive(s_audio_queue, &chunk, pdMS_TO_TICKS(500)) != pdTRUE) {
             // ★ xiaozhi: TX 常开，空闲时写静音填充，不产生开关跳变
             if (tx_active) {
                 memset(stereo, 0, sizeof(stereo));
@@ -261,7 +261,7 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
                             // ★ 流式显示 AI 回复文本
                             cJSON *text = cJSON_GetObjectItem(json, "text");
                             if (text && cJSON_IsString(text)) {
-                                printf("[小眠] %s\n", text->valuestring);
+                                printf("[小安] %s\n", text->valuestring);
                             }
                         }
                     }

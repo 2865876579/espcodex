@@ -39,7 +39,8 @@ static volatile bool s_tx_enabled = false;
 #define REF_BUF_SAMPLES  9600   // 600ms @ 16kHz
 #define AEC_REF_DELAY_SAMPLES 2300  // 143ms 延迟，保证读写不重叠
 static int16_t s_ref_ring[REF_BUF_SAMPLES];
-static volatile int s_ref_pos = 0;  // 总写入样本数（单调递增），32-bit 原子读写
+static volatile int s_ref_pos = 0;  // 总写入样本数（单调递增）
+static portMUX_TYPE s_ref_lock = portMUX_INITIALIZER_UNLOCKED;
 
 
 void audio_out_init(void)
@@ -64,9 +65,9 @@ void audio_out_init(void)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx_chan, &tx_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx_chan));
     s_tx_enabled = true;
-    // ★ I2S 信号增强驱动，抗 WiFi 射频干扰
+    // ★ I2S 信号增强驱动抗 WiFi 干扰（LRC 不加，紧挨 DIN 怕串扰麦克风）
     gpio_set_drive_capability(I2S0_BCLK_GPIO, GPIO_DRIVE_CAP_3);
-    gpio_set_drive_capability(I2S0_LRC_GPIO,  GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(I2S0_LRC_GPIO,  GPIO_DRIVE_CAP_0);
     gpio_set_drive_capability(I2S0_DOUT_GPIO, GPIO_DRIVE_CAP_3);
 
     // ★ 预写静音填满 DMA，避免首帧到达前 DMA 循环播残留数据
@@ -131,22 +132,18 @@ void audio_out_write(const uint8_t *data, size_t len)
     size_t written = 0;
     i2s_channel_write(s_tx_chan, data, len, &written, portMAX_DELAY);
 
-    // ★ AEC 参考：抄 mono PCM 到 ring buffer
-    //   写位置 = s_ref_pos，读位置 = s_ref_pos - 2300（AEC delay）
-    //   单次最多写 960 samples < 2300 gap → 读写永不重叠 → 无需锁
+    // ★ AEC 参考：抄 mono PCM 到 ring buffer（有锁，双核 cache 同步）
     int frames = (int)len / 4;
     const int16_t *stereo = (const int16_t *)data;
+    portENTER_CRITICAL(&s_ref_lock);
     int pos = s_ref_pos;
     int idx = pos % REF_BUF_SAMPLES;
     int tail = REF_BUF_SAMPLES - idx;
-    int part1 = (frames < tail) ? frames : tail;
-    for (int i = 0; i < part1; i++) {
-        s_ref_ring[idx + i] = stereo[i * 2];
-    }
-    for (int i = part1; i < frames; i++) {
-        s_ref_ring[i - part1] = stereo[i * 2];
-    }
-    s_ref_pos = pos + frames;  // 32-bit 原子写
+    int n = (frames < tail) ? frames : tail;
+    for (int i = 0; i < n; i++) s_ref_ring[idx + i] = stereo[i * 2];
+    for (int i = n; i < frames; i++) s_ref_ring[i - n] = stereo[i * 2];
+    s_ref_pos = pos + frames;
+    portEXIT_CRITICAL(&s_ref_lock);
 }
 
 
@@ -155,8 +152,8 @@ i2s_chan_handle_t audio_out_get_rx_chan(void) { return s_rx_chan; }
 
 int audio_out_read_ref(int16_t *out, int want)
 {
-    // ★ 无锁读：读位置 = s_ref_pos - AEC_REF_DELAY_SAMPLES
-    //   写最多进 960 samples @ s_ref_pos，gap=2300 → 永不重叠
+    // ★ 有锁读：临界区保护，保证跨核 cache 一致
+    portENTER_CRITICAL(&s_ref_lock);
     int pos = s_ref_pos;
     int total = pos - AEC_REF_DELAY_SAMPLES;
     if (total < 0) total = 0;
@@ -168,6 +165,7 @@ int audio_out_read_ref(int16_t *out, int want)
         if (idx >= REF_BUF_SAMPLES) idx -= REF_BUF_SAMPLES;
         out[i] = s_ref_ring[idx];
     }
+    portEXIT_CRITICAL(&s_ref_lock);
 
     // 历史不够的部分补零
     if (copy < want) {

@@ -103,6 +103,9 @@ static turn_wait_result_t wait_for_turn_result(int timeout_ms)
             }
             return TURN_DONE;
         }
+        if (ws_client_is_tts_active()) {
+            waited = 0;  // ★ TTS 还在播，超时不倒计时
+        }
         if (!ws_client_is_connected()) {
             return TURN_WS_LOST;
         }
@@ -371,14 +374,14 @@ static void run_dialog(void)
     s_dialog_active = true;
     s_wake_event = false;
 
-    printf("\n[唤醒] 你好小智 → 进入对话\n");
+    printf("\n[唤醒] 你好小安 → 进入对话\n");
     if (!wait_for_ws_connected(WS_READY_TIMEOUT_MS)) {
         s_dialog_active = false;
         return;
     }
 
     ws_client_clear_events();
-    ws_client_send_raw("{\"type\":\"listen\",\"state\":\"detect\",\"text\":\"你好小智\"}");
+    ws_client_send_raw("{\"type\":\"listen\",\"state\":\"detect\",\"text\":\"你好小安\"}");
 
     // 等服务器问候语（tts start 已占住连接，音频帧随后就到）
     turn_wait_result_t wake_result = wait_for_turn_result(3000);
@@ -458,7 +461,7 @@ void app_main(void)
     }
     vTaskDelay(pdMS_TO_TICKS(1500));
 
-    printf("[就绪] 说 '你好小智' 唤醒\n\n");
+    printf("[就绪] 说 '你好小安' 唤醒\n\n");
 
     uint8_t rx_buf[128];
     TickType_t last_ws_restart = xTaskGetTickCount();
