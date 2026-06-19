@@ -24,6 +24,7 @@ static volatile bool s_pending_dialog_end = false;
 static QueueHandle_t s_audio_queue = NULL;  // 音频数据队列（WebSocket → Audio Task）
 static volatile uint32_t s_tts_chunks_queued = 0;
 static volatile uint32_t s_tts_chunks_dropped = 0;
+static OpusDecoder *s_decoder = NULL;  // ★ 模块级，避免每次 TTS 懒初始化
 
 // 借鉴 xiaozhi：用 spinlock 保护 consume 操作的原子性，避免 WebSocket 任务
 // 和主循环同时 consume 标志位时丢失事件
@@ -33,9 +34,9 @@ static portMUX_TYPE s_event_spinlock = portMUX_INITIALIZER_UNLOCKED;
 #define OPUS_CHANNELS       1
 #define AUDIO_QUEUE_DEPTH   512
 #define AUDIO_PLAYER_STACK_BYTES 24576
-#define AUDIO_QUEUE_SEND_TIMEOUT_MS 100
+#define AUDIO_QUEUE_SEND_TIMEOUT_MS 500
 #define AUDIO_END_SEND_TIMEOUT_MS 5000
-#define AUDIO_PLAYBACK_DRAIN_MS 350
+#define AUDIO_PLAYBACK_DRAIN_MS 80
 
 // 队列元素：一个 Opus 编码帧
 typedef struct {
@@ -50,6 +51,16 @@ static void begin_tts_stream(void)
     s_pending_dialog_end = false;
     s_tts_chunks_queued = 0;
     s_tts_chunks_dropped = 0;
+
+    // ★ 预创建 Opus 解码器，避免首帧到达时才 malloc 导致丢帧
+    if (!s_decoder) {
+        int err = 0;
+        s_decoder = opus_decoder_create(OPUS_SAMPLE_RATE, OPUS_CHANNELS, &err);
+        if (err != OPUS_OK || !s_decoder) {
+            ESP_LOGE(TAG, "Opus decoder create failed: %d", err);
+            s_decoder = NULL;
+        }
+    }
 }
 
 static void end_tts_stream(bool dialog_end)
@@ -108,13 +119,12 @@ static void audio_player_task(void *arg)
     int16_t pcm[960];           // 60ms @16kHz
     int16_t stereo[960 * 2];    // mono → stereo
 
-    OpusDecoder *decoder = NULL;
     audio_chunk_t chunk;
     int played_frames = 0;
     bool tx_active = false;     // 跟踪 TX 是否已开启
 
     while (1) {
-        if (xQueueReceive(s_audio_queue, &chunk, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        if (xQueueReceive(s_audio_queue, &chunk, pdMS_TO_TICKS(50)) != pdTRUE) {
             // ★ xiaozhi: TX 常开，空闲时写静音填充，不产生开关跳变
             if (tx_active) {
                 memset(stereo, 0, sizeof(stereo));
@@ -124,15 +134,14 @@ static void audio_player_task(void *arg)
             continue;
         }
 
-        // NULL 数据 = 流结束信号，只排空不销毁解码器
+        // NULL 数据 = 流结束信号
         if (chunk.data == NULL) {
+            // ★ 刷静音填满整个 DMA 环，根除残留音频回绕
+            audio_out_flush_silence();
             if (played_frames > 0) {
                 vTaskDelay(pdMS_TO_TICKS(AUDIO_PLAYBACK_DRAIN_MS));
-                played_frames = 0;
             }
-            // ★ 立刻写静音帧覆盖 DMA 尾巴，避免残留音频循环播放
-            memset(stereo, 0, sizeof(stereo));
-            audio_out_write((const uint8_t *)stereo, sizeof(stereo));
+            played_frames = 0;
             tx_active = false;
             if (s_tts_active) {
                 s_tts_active = false;
@@ -145,38 +154,26 @@ static void audio_player_task(void *arg)
             continue;
         }
 
-        // 懒初始化 Opus 解码器
-        if (!decoder) {
-            int err = 0;
-            decoder = opus_decoder_create(OPUS_SAMPLE_RATE, OPUS_CHANNELS, &err);
-            if (err != OPUS_OK || !decoder) {
-                ESP_LOGE(TAG, "Opus decoder create failed: %d", err);
-                free(chunk.data);
-                continue;
-            }
+        // Opus → PCM（解码器由 begin_tts_stream 预创建）
+        if (!s_decoder) {
+            free(chunk.data);
+            continue;
         }
-
-        // Opus → PCM
-        int samples = opus_decode(decoder, chunk.data, chunk.len, pcm, 960, 0);
+        int samples = opus_decode(s_decoder, chunk.data, chunk.len, pcm, 960, 0);
         free(chunk.data);  // 尽早释放
 
         if (samples < 0) {
-            // ★ xiaozhi: FEC → PLC 软降级，不重建解码器，避免卡顿
-            samples = opus_decode(decoder, NULL, 0, pcm, 960, 1);  // FEC 纠错
+            // ★ xiaozhi: FEC → PLC 软降级
+            samples = opus_decode(s_decoder, NULL, 0, pcm, 960, 1);  // FEC 纠错
         }
         if (samples < 0) {
-            samples = opus_decode(decoder, NULL, 0, pcm, 960, 0);  // PLC 插值
-        }
-        if (samples < 0) {
-            ESP_LOGE(TAG, "Opus decode error: %d", samples);
-            continue;
-        }
-        if (samples == 0) {
-            // ★ DTX 空帧/FEC → 用 PLC 插值填充，不跳帧避免 DMA 重复旧数据
-            samples = opus_decode(decoder, NULL, 0, pcm, 960, 0);
+            samples = opus_decode(s_decoder, NULL, 0, pcm, 960, 0);  // PLC 插值
         }
         if (samples <= 0) {
-            continue;
+            // ★ FEC/PLC 都失败 → 填静音帧，DMA 不断流，不产生 pop
+            if (samples < 0) ESP_LOGW(TAG, "Opus decode failed (%d), filling silence", samples);
+            memset(pcm, 0, sizeof(pcm));
+            samples = 960;
         }
 
         // TX 已常开，记录播放状态即可

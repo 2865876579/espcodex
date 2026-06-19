@@ -31,6 +31,9 @@ i2s_chan_handle_t audio_out_get_rx_chan(void);
 /** AEC 参考信号：读最近 N 个发往喇叭的 mono 样本。返回实际读到的数量。 */
 int audio_out_read_ref(int16_t *out, int want);
 
+/** 刷静音填满整个 DMA 环，消除残留音频。TTS 流结束时调用。 */
+void audio_out_flush_silence(void);
+
 #ifdef __cplusplus
 }
 #endif

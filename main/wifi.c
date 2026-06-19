@@ -73,6 +73,9 @@ int wifi_connect(const char *ssid, const char *password)
     // 关闭 WiFi 省电模式，避免流式接收数据时丢包
     esp_wifi_set_ps(WIFI_PS_NONE);
 
+    // ★ 降低 WiFi TX 功率至 15dBm（默认 20dBm），减少对 MAX98357A 的射频干扰
+    esp_wifi_set_max_tx_power(60);  // 单位 0.25dBm，60 × 0.25 = 15dBm
+
     ESP_LOGI(TAG, "Connecting Wi-Fi: %s", ssid);
 
     // 等待连上或失败

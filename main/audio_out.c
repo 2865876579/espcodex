@@ -37,9 +37,9 @@ static volatile bool s_tx_enabled = false;
 // ── AEC 参考信号 ring buffer ──────────────────────────
 // 借鉴 xiaozhi：播放音频时同步抄一份给 AFE 做回声消除
 #define REF_BUF_SAMPLES  9600   // 600ms @ 16kHz
+#define AEC_REF_DELAY_SAMPLES 2300  // 143ms 延迟，保证读写不重叠
 static int16_t s_ref_ring[REF_BUF_SAMPLES];
-static volatile int s_ref_pos = 0;  // 总写入样本数（单调递增）
-static portMUX_TYPE s_ref_lock = portMUX_INITIALIZER_UNLOCKED;
+static volatile int s_ref_pos = 0;  // 总写入样本数（单调递增），32-bit 原子读写
 
 
 void audio_out_init(void)
@@ -64,7 +64,10 @@ void audio_out_init(void)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx_chan, &tx_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx_chan));
     s_tx_enabled = true;
-    gpio_set_drive_capability(I2S0_DOUT_GPIO, GPIO_DRIVE_CAP_0);
+    // ★ I2S 信号增强驱动，抗 WiFi 射频干扰
+    gpio_set_drive_capability(I2S0_BCLK_GPIO, GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(I2S0_LRC_GPIO,  GPIO_DRIVE_CAP_3);
+    gpio_set_drive_capability(I2S0_DOUT_GPIO, GPIO_DRIVE_CAP_3);
 
     // ★ 预写静音填满 DMA，避免首帧到达前 DMA 循环播残留数据
     int16_t *silence = calloc(1, DMA_FRAME_NUM * 4);  // stereo 16bit
@@ -128,15 +131,22 @@ void audio_out_write(const uint8_t *data, size_t len)
     size_t written = 0;
     i2s_channel_write(s_tx_chan, data, len, &written, portMAX_DELAY);
 
-    // ★ AEC 参考：同步抄一份 mono PCM 到 ring buffer（跨核原子写）
+    // ★ AEC 参考：抄 mono PCM 到 ring buffer
+    //   写位置 = s_ref_pos，读位置 = s_ref_pos - 2300（AEC delay）
+    //   单次最多写 960 samples < 2300 gap → 读写永不重叠 → 无需锁
     int frames = (int)len / 4;
     const int16_t *stereo = (const int16_t *)data;
-    portENTER_CRITICAL(&s_ref_lock);
-    for (int i = 0; i < frames; i++) {
-        s_ref_ring[s_ref_pos % REF_BUF_SAMPLES] = stereo[i * 2];
-        s_ref_pos++;
+    int pos = s_ref_pos;
+    int idx = pos % REF_BUF_SAMPLES;
+    int tail = REF_BUF_SAMPLES - idx;
+    int part1 = (frames < tail) ? frames : tail;
+    for (int i = 0; i < part1; i++) {
+        s_ref_ring[idx + i] = stereo[i * 2];
     }
-    portEXIT_CRITICAL(&s_ref_lock);
+    for (int i = part1; i < frames; i++) {
+        s_ref_ring[i - part1] = stereo[i * 2];
+    }
+    s_ref_pos = pos + frames;  // 32-bit 原子写
 }
 
 
@@ -145,19 +155,19 @@ i2s_chan_handle_t audio_out_get_rx_chan(void) { return s_rx_chan; }
 
 int audio_out_read_ref(int16_t *out, int want)
 {
-    #define AEC_REF_DELAY_SAMPLES 2300
-
-    // ★ 跨核原子读：锁快照 pos，再批量拷数据
-    portENTER_CRITICAL(&s_ref_lock);
+    // ★ 无锁读：读位置 = s_ref_pos - AEC_REF_DELAY_SAMPLES
+    //   写最多进 960 samples @ s_ref_pos，gap=2300 → 永不重叠
     int pos = s_ref_pos;
     int total = pos - AEC_REF_DELAY_SAMPLES;
     if (total < 0) total = 0;
     int copy = (total < want) ? total : want;
     int start = (pos - AEC_REF_DELAY_SAMPLES - copy) % REF_BUF_SAMPLES;
+    if (start < 0) start += REF_BUF_SAMPLES;
     for (int i = 0; i < copy; i++) {
-        out[i] = s_ref_ring[(start + i) % REF_BUF_SAMPLES];
+        int idx = start + i;
+        if (idx >= REF_BUF_SAMPLES) idx -= REF_BUF_SAMPLES;
+        out[i] = s_ref_ring[idx];
     }
-    portEXIT_CRITICAL(&s_ref_lock);
 
     // 历史不够的部分补零
     if (copy < want) {
@@ -165,6 +175,20 @@ int audio_out_read_ref(int16_t *out, int want)
         memset(out, 0, (want - copy) * sizeof(int16_t));
     }
     return want;
+}
+
+
+void audio_out_flush_silence(void)
+{
+    // ★ 填满全部 DMA 描述符，消除 TTS 结束后残留的旧音频
+    if (!s_tx_chan) return;
+    static int16_t silence[511 * 2];  // 1 descriptor = 511 stereo samples
+    static bool inited = false;
+    if (!inited) { memset(silence, 0, sizeof(silence)); inited = true; }
+    for (int i = 0; i < DMA_DESC_NUM; i++) {
+        size_t w = 0;
+        i2s_channel_write(s_tx_chan, silence, sizeof(silence), &w, portMAX_DELAY);
+    }
 }
 
 
