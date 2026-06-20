@@ -25,7 +25,7 @@ extern "C" {
 #define VALVE_PIN 21
 
 // ── 安全参数 ─────────────────────────────────────
-#define PUMP_MAX_RUN_MS      5000   // 气泵最长连续运行时间（防过热）
+#define PUMP_MAX_RUN_MS      7000   // 气泵最长连续运行时间
 #define PUMP_COOLDOWN_MS     3000   // 气泵最短冷却间隔
 #define VALVE_RELEASE_MS     5000   // 紧急泄气时阀保持打开时间
 #define PRESSURE_MAX_KPA     5.0f   // 气囊压力上限（kPa），配合 MCP5010DP

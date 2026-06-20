@@ -27,6 +27,31 @@ static volatile uint32_t s_tts_chunks_queued = 0;
 static volatile uint32_t s_tts_chunks_dropped = 0;
 static OpusDecoder *s_decoder = NULL;  // ★ 模块级，避免每次 TTS 懒初始化
 
+// ── 气泵命令（独立 FreeRTOS 任务，不阻塞 audio/websocket）──
+typedef enum { PUMP_NONE, PUMP_TILT, PUMP_RECOVER, PUMP_STOP } pump_cmd_t;
+static volatile pump_cmd_t s_pump_cmd = PUMP_NONE;
+static volatile int        s_pump_dur = 0;
+static TaskHandle_t        s_pump_task = NULL;
+
+static void pump_task(void *arg) {
+    while (1) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        pump_cmd_t cmd = s_pump_cmd; int dur = s_pump_dur;
+        s_pump_cmd = PUMP_NONE;  // ★ 在 pump_task 里消费后清除
+        if (cmd == PUMP_TILT) {
+            printf("[枕头] 充气 %ds\n", dur);
+            pump_start(); vTaskDelay(pdMS_TO_TICKS(dur * 1000)); pump_stop();
+        } else if (cmd == PUMP_RECOVER) {
+            printf("[枕头] 泄气 %ds\n", dur);
+            valve_open(); vTaskDelay(pdMS_TO_TICKS(dur * 1000)); valve_close();
+        } else if (cmd == PUMP_STOP) {
+            printf("[枕头] 急停\n");
+            emergency_release(); vTaskDelay(pdMS_TO_TICKS(3000)); valve_close();
+        }
+        printf("[枕头] 完成\n");
+    }
+}
+
 // 借鉴 xiaozhi：用 spinlock 保护 consume 操作的原子性，避免 WebSocket 任务
 // 和主循环同时 consume 标志位时丢失事件
 static portMUX_TYPE s_event_spinlock = portMUX_INITIALIZER_UNLOCKED;
@@ -125,6 +150,11 @@ static void audio_player_task(void *arg)
     bool tx_active = false;     // 跟踪 TX 是否已开启
 
     while (1) {
+        // ★ 气泵命令：通知独立 pump 任务执行
+        if (s_pump_cmd != PUMP_NONE && s_pump_task) {
+            xTaskNotifyGive(s_pump_task);
+        }
+
         if (xQueueReceive(s_audio_queue, &chunk, pdMS_TO_TICKS(500)) != pdTRUE) {
             // ★ xiaozhi: TX 常开，空闲时写静音填充，不产生开关跳变
             if (tx_active) {
@@ -313,34 +343,20 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
                     }
                 }
                 else if (strcmp(type->valuestring, "pillow_cmd") == 0) {
-                    // ★ LLM 枕头控制：充气/泄气/停止
-                    cJSON *jaction = cJSON_GetObjectItem(json, "action");
-                    cJSON *jdur   = cJSON_GetObjectItem(json, "duration_sec");
-                    const char *action = jaction ? jaction->valuestring : "";
-                    int dur = jdur ? (int)cJSON_GetNumberValue(jdur) : 3;
+                    // ★ LLM 枕头控制：只设置标志，由 audio_player_task 执行（不阻塞 websocket）
+                    const char *action = cJSON_GetStringValue(cJSON_GetObjectItem(json, "action"));
+                    int dur = (int)cJSON_GetNumberValue(cJSON_GetObjectItem(json, "duration_sec"));
+                    if (dur < 1) dur = 3;
+                    if (dur > 7) dur = 7;
 
                     if (strcmp(action, "tilt") == 0) {
-                        if (dur > 5) dur = 5;  // 安全上限
-                        printf("[枕头] LLM指令: 充气 %ds\n", dur);
-                        pump_start();
-                        vTaskDelay(pdMS_TO_TICKS(dur * 1000));
-                        pump_stop();
+                        s_pump_cmd = PUMP_TILT; s_pump_dur = dur;
                     } else if (strcmp(action, "recover") == 0) {
-                        printf("[枕头] LLM指令: 泄气恢复\n");
-                        valve_open();
-                        vTaskDelay(pdMS_TO_TICKS(3000));
-                        valve_close();
+                        s_pump_cmd = PUMP_RECOVER; s_pump_dur = dur;
                     } else if (strcmp(action, "stop") == 0) {
-                        printf("[枕头] LLM指令: 紧急停止\n");
-                        emergency_release();
+                        s_pump_cmd = PUMP_STOP; s_pump_dur = 0;
                     }
-                    // 回状态
-                    {
-                        char status_json[128];
-                        snprintf(status_json, sizeof(status_json),
-                            "{\"type\":\"pillow_status\",\"action\":\"%s\",\"result\":\"ok\"}", action);
-                        ws_client_send_raw(status_json);
-                    }
+                    printf("[枕头] LLM指令: %s %ds (排队中)\n", action, dur);
                 }
                 else if (strcmp(type->valuestring, "dialog_end") == 0) {
                     end_tts_stream(true);
@@ -373,6 +389,9 @@ void ws_client_start(const char *uri)
 
     // 音频播放任务：prio=9 高于 feed(8)，确保 DMA 不断流
     xTaskCreatePinnedToCore(audio_player_task, "audio_player", AUDIO_PLAYER_STACK_BYTES, NULL, 9, NULL, 1);
+
+    // 气泵任务：独立栈 4KB，不阻塞音频和 websocket
+    xTaskCreate(pump_task, "pump", 4096, NULL, 2, &s_pump_task);
 
     // WebSocket 客户端：16KB 栈（库内部帧解析也需要栈空间！）
     esp_websocket_client_config_t ws_cfg = {
