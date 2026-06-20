@@ -14,6 +14,7 @@
 #include "audio_out.h"
 #include "afe_wake_word.h"
 #include "ws_client.h"
+#include "pump_driver.h"
 #include "opus.h"
 
 #define WIFI_SSID  "qwe"
@@ -436,6 +437,7 @@ void app_main(void)
         while (1) { vTaskDelay(pdMS_TO_TICKS(1000)); }
     }
     audio_out_init();
+    pump_driver_init();
 
     uart_config_t uart_cfg = {
         .baud_rate = 115200,

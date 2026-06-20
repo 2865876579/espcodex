@@ -10,6 +10,7 @@
 #include "esp_err.h"
 #include "cJSON.h"
 #include "audio_out.h"
+#include "pump_driver.h"
 #include "opus.h"
 #include "mbedtls/base64.h"
 
@@ -309,6 +310,36 @@ static void ws_event_handler(void *arg, esp_event_base_t event_base,
                     cJSON *text = cJSON_GetObjectItem(json, "text");
                     if (text && cJSON_IsString(text)) {
                         printf("[你] %s\n", text->valuestring);
+                    }
+                }
+                else if (strcmp(type->valuestring, "pillow_cmd") == 0) {
+                    // ★ LLM 枕头控制：充气/泄气/停止
+                    cJSON *jaction = cJSON_GetObjectItem(json, "action");
+                    cJSON *jdur   = cJSON_GetObjectItem(json, "duration_sec");
+                    const char *action = jaction ? jaction->valuestring : "";
+                    int dur = jdur ? (int)cJSON_GetNumberValue(jdur) : 3;
+
+                    if (strcmp(action, "tilt") == 0) {
+                        if (dur > 5) dur = 5;  // 安全上限
+                        printf("[枕头] LLM指令: 充气 %ds\n", dur);
+                        pump_start();
+                        vTaskDelay(pdMS_TO_TICKS(dur * 1000));
+                        pump_stop();
+                    } else if (strcmp(action, "recover") == 0) {
+                        printf("[枕头] LLM指令: 泄气恢复\n");
+                        valve_open();
+                        vTaskDelay(pdMS_TO_TICKS(3000));
+                        valve_close();
+                    } else if (strcmp(action, "stop") == 0) {
+                        printf("[枕头] LLM指令: 紧急停止\n");
+                        emergency_release();
+                    }
+                    // 回状态
+                    {
+                        char status_json[128];
+                        snprintf(status_json, sizeof(status_json),
+                            "{\"type\":\"pillow_status\",\"action\":\"%s\",\"result\":\"ok\"}", action);
+                        ws_client_send_raw(status_json);
                     }
                 }
                 else if (strcmp(type->valuestring, "dialog_end") == 0) {

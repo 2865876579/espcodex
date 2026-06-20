@@ -6,6 +6,7 @@ idf_component_register(
         "audio_in.c"
         "ws_client.c"
         "afe_wake_word.c"
+        "pump_driver.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp_wifi
